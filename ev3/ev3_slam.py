@@ -167,7 +167,7 @@ def main():
                 left_delta, right_delta = do_move(
                     cmd["left_speed"],
                     cmd["right_speed"],
-                    cmd["duration_ms"]
+                    cmd["distance_cm"]
                 )
                 scan_data = do_scan(
                     cmd.get("start_angle", -90),

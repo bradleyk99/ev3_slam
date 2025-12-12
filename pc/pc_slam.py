@@ -3,6 +3,8 @@ import json
 import termios
 import time
 import math
+import matplotlib
+matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 from matplotlib import patches
 import numpy as np
@@ -95,10 +97,10 @@ class Scans:
         dist_center = (dist_left + dist_right)/2
 
         dtheta = (dist_right - dist_left)/self.WHEEL_BASE
-        theta = theta + dtheta
+        mid_theta = theta + dtheta / 2 # More accurate to reduce drift
 
-        dx = dist_center * math.cos(theta)
-        dy = dist_center * math.sin(theta)
+        dx = dist_center * math.cos(mid_theta)
+        dy = dist_center * math.sin(mid_theta)
 
         return dx, dy, dtheta
 
@@ -116,7 +118,7 @@ class Scans:
         points = []
 
         for angle_deg, distance_cm in scan:
-            if distance_cm > 200:
+            if distance_cm > 100:   # Ignore readings above 150cm - unreliable
                 continue
 
             # Convert to robot frame
@@ -181,7 +183,7 @@ class Scans:
         intersection = p1 + t * d1
         return intersection
 
-    def detect_corners(self, points, distance_threshold=0.08, angle_threshold=20):
+    def detect_corners(self, points, distance_threshold=0.15, angle_threshold=10):
         segments = self.segment_scan(points, distance_threshold)
         print(f"  Segments: {len(segments)}, sizes: {[len(s) for s in segments]}")
 
@@ -213,7 +215,7 @@ class Scans:
                         math.sqrt((intersection[0]-seg2[0][0])**2 + (intersection[1]-seg2[0][1])**2),
                         math.sqrt((intersection[0]-seg2[-1][0])**2 + (intersection[1]-seg2[-1][1])**2),
                     ]
-                    if min(dists) < 0.15:
+                    if min(dists) < 0.25:
                         corners.append(tuple(intersection))
         
         return corners
@@ -303,12 +305,12 @@ class EKFSlam:
         # Covariance
         self.P = np.diag([0.1, 0.1, 0.1]) # Assume small initial uncertainty
         # Motion noise
-        self.Q = np.diag([0.01, 0.01, 0.1]) # x, y, theta variance per motion
+        self.Q = np.diag([0.001, 0.001, 0.02]) # x, y, theta variance per motion
         # Observation (measurement) noise
-        self.R = np.diag([0.02,0.05]) # range, bearing variance
+        self.R = np.diag([0.1,0.2]) # range, bearing variance
 
         # Data association threshold
-        self.association_threshold = 0.2 # meters
+        self.association_threshold = 0.6 # meters
 
         # Number of landmarks 
         self.n_landmarks = 0
@@ -372,8 +374,12 @@ class EKFSlam:
                 min_dist = dist
                 best_idx = i
         
+        print(f"    Observed corner at ({lx:.3f}, {ly:.3f}), nearest landmark L{best_idx+1} at dist {min_dist:.3f}m")
+        
         if min_dist < self.association_threshold:
+            print(f"    -> Associated with L{best_idx+1}")
             return best_idx
+        print(f"    -> New landmark (threshold {self.association_threshold})")
         return None
     
     def add_landmark(self, lx, ly):
@@ -422,6 +428,11 @@ class EKFSlam:
 
         # Innovation
         z = np.array([r_obs - r_pred, self.normalize_angle(b_obs - b_pred)])
+
+        # Innovation gating - reject if too large
+        if abs(z[0]) > 0.5 or abs(z[1]) > np.radians(45):
+            print(f"    Rejected update: innovation too large (dr={z[0]:.3f}, db={np.degrees(z[1]):.1f}°)")
+            return
 
         # Jacobian of observation model
         n = len(self.state)
@@ -483,6 +494,187 @@ class EKFSlam:
 
         return observations
 
+class OccupancyGrid:
+    def __init__(self, size=5.0, resolution=0.02):
+        # Size: total map size in meters
+        # Resolution: Cell size in meters
+        self.resolution = resolution
+        self.size = size
+        self.n_cells = int(size/resolution)
+
+        # Grid centered at origin, 0 = unknown, positive = occupied, negative=free
+        # Log-odds used for occupancy
+        self.grid = np.zeros((self.n_cells, self.n_cells))
+
+        # Log-odds parameters
+        self.l_occ = 0.6 # hit
+        self.l_free = -0.4 # miss
+        self.l_max = 5.0
+        self.l_min = -5.0
+    
+    def world_to_grid(self,x,y):
+        # Convert world coordinates to grid indicie
+        gx = int((x+self.size/2)/self.resolution)
+        gy = int((y+self.size/2)/self.resolution)
+        return gx,gy
+    
+    def grid_to_world(self,gx,gy):
+        # Convert grid indicies to world coordinates
+        x = gx*self.resolution - self.size/2
+        y = gy*self.resolution - self.size/2
+        return x,y
+    
+    def in_bounds(self,gx,gy):
+        return 0 <= gx < self.n_cells and 0 <=gy < self.n_cells
+    
+    def update(self, pose, points):
+        # Update grid with scan data
+        rx, ry, _= pose
+        robot_gx, robot_gy = self.world_to_grid(rx,ry)
+
+        for px, py in points:
+            # mark endpoint as occupied
+            gx, gy = self.world_to_grid(px, py)
+            if self.in_bounds(gx, gy):
+                self.grid[gy,gx] = np.clip(self.grid[gy,gx] + self.l_occ, self.l_min, self.l_max)
+            
+            # Trace ray from robot to point marka s free
+            self.trace_ray(robot_gx, robot_gy, gx, gy)
+
+    def trace_ray(self, x0, y0, x1, y1):
+        # Bresenham's line algorithm to mark free cells
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+        
+        x, y = x0, y0
+        while True:
+            # Don't mark the endpoint (it's occupied)
+            if x == x1 and y == y1:
+                break
+            
+            if self.in_bounds(x, y):
+                self.grid[y, x] = np.clip(
+                    self.grid[y, x] + self.l_free,
+                    self.l_min, self.l_max
+                )
+            
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
+    
+    def get_probability_grid(self):
+        # convert log odds to probability
+        return 1 - 1/(1 + np.exp(self.grid))
+    
+    def plot(self, ekf=None, trajectory=None):
+        # plot occupancy grid with optional ekf overlay
+        fig, ax = plt.subplots(figsize=(12, 12))
+        
+        # Plot occupancy grid
+        prob_grid = self.get_probability_grid()
+        extent = [-self.size/2, self.size/2, -self.size/2, self.size/2]
+        ax.imshow(prob_grid, cmap='gray_r', origin='lower', 
+                  extent=extent, vmin=0, vmax=1)
+        
+        if trajectory and len(trajectory) > 1:
+            tx, ty = zip(*[(p[0], p[1]) for p in trajectory])
+            ax.plot(tx, ty, 'b-', linewidth=2, label='Trajectory')
+            ax.plot(tx[0], ty[0], 'go', markersize=10, label='Start')
+        
+        if ekf is not None:
+            # Plot landmarks
+            landmarks = ekf.get_landmarks()
+            if landmarks:
+                lx, ly = zip(*landmarks)
+                ax.scatter(lx, ly, c='red', s=100, marker='^', 
+                          label=f'Landmarks ({len(landmarks)})', zorder=5)
+                for i, (x, y) in enumerate(landmarks):
+                    ax.annotate(f'L{i+1}', (x, y), textcoords='offset points', 
+                               xytext=(5, 5), color='red')
+            
+            # Plot robot
+            pose = ekf.get_pose()
+            rx, ry, rtheta = pose
+            ax.plot(rx, ry, 'bo', markersize=12, label='Robot', zorder=6)
+            arrow_len = 0.1
+            ax.arrow(rx, ry,
+                    arrow_len * np.cos(rtheta),
+                    arrow_len * np.sin(rtheta),
+                    head_width=0.03, color='blue', zorder=6)
+        
+        ax.set_xlim(-self.size/2, self.size/2)
+        ax.set_ylim(-self.size/2, self.size/2)
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.set_title('Occupancy Grid Map')
+        plt.show()
+        
+class LivePlotter:
+    def __init__(self, occ_grid):
+        plt.ion() #interactive mode
+        self.fig, self.ax = plt.subplots(figsize=(10,10))
+        self.occ_grid=occ_grid
+
+        # Initial empty plot
+        self.img = self.ax.imshow(
+            occ_grid.get_probability_grid(),
+            cmap='gray_r', origin='lower',
+            extent=[-occ_grid.size/2, occ_grid.size/2,
+                    -occ_grid.size/2, occ_grid.size/2],
+            vmin=0, vmax=1
+        )
+
+        self.trajectory_line, = self.ax.plot([], [], 'b-', linewidth=2)
+        self.robot_dot, = self.ax.plot([], [], 'bo', markersize=12)
+        self.landmark_scatter = self.ax.scatter([], [], c='red', s=100, marker='^')
+
+        self.ax.set_xlim(-occ_grid.size/2, occ_grid.size/2)
+        self.ax.set_ylim(-occ_grid.size/2, occ_grid.size/2)
+        self.ax.set_aspect('equal')
+        self.ax.grid(True, alpha=0.3)
+        self.ax.set_xlabel('X (m)')
+        self.ax.set_ylabel('Y (m)')
+        self.ax.set_title('Live EKF-SLAM')
+
+        plt.show()
+
+    def update(self, ekf, trajectory):
+        # update occupancy grid image
+        self.img.set_data(self.occ_grid.get_probability_grid())
+
+        # Update trajectory
+        if len(trajectory) > 0:
+            tx = [p[0] for p in trajectory]
+            ty = [p[1] for p in trajectory]
+            self.trajectory_line.set_data(tx,ty)
+
+        # Update robot position
+        pose = ekf.get_pose()
+        self.robot_dot.set_data([pose[0]], [pose[1]])
+
+        # Update landmarks
+        landmarks = ekf.get_landmarks()
+        if landmarks:
+            lx, ly = zip(*landmarks)
+            self.landmark_scatter.set_offsets(list(zip(lx,ly)))
+
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+        plt.pause(0.01)
+    
+    def close(self):
+        plt.ioff()
+        plt.close()
 
 def main():
     ev3 = EV3Connection("/dev/rfcomm0")
