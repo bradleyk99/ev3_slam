@@ -2,6 +2,7 @@
 # Program to control the robot within an environment and perform ekf slam
 
 from pc_slam import EV3Connection, EKFSlam, Scans
+import math
 
 ev3 = EV3Connection("/dev/rfcomm0")
 scans = Scans()
