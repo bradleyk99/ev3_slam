@@ -494,6 +494,282 @@ class EKFSlam:
 
         return observations
 
+class Explorer:
+    def __init__(self, ev3, scans, ekf):
+        self.ev3 = ev3
+        self.scans = scans
+        self.ekf = ekf
+        self.visited_position = []
+        self.entry_pose = None
+
+    def detect_gaps(self, scan_result, pose, min_gap_width=0.5):
+        # Detect gaps in scan that could be doors
+        points = self.scans.scan_to_cartesian(scan_result['scan'], pose)
+        rx, ry, rtheta = pose
+        gaps = []
+
+        if len(points)<2:
+            return gaps
+        
+        for i in range(len(points) - 1):
+            p1 = points[i]
+            p2 = points[i+1]
+
+            # Distance between consecutive scan points
+            gap_width = math.sqrt((p2[0] - p1[0])**2 + (p2[1]-p1[1])**2)
+
+            if gap_width > min_gap_width:
+                # Discovered gap - calculate center 
+                gap_center = ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
+                gap_angle = math.atan2(gap_center[1] - ry, gap_center[0] - rx)
+                gap_dist = math.sqrt((gap_center[0] - rx)**2 + (gap_center[1] - ry)**2)
+
+                gaps.append({
+                    'center': gap_center,
+                    'width': gap_width,
+                    'angle': gap_angle,
+                    'distance': gap_dist
+                })
+                print(f"  Gap found: width={gap_width:.2f}m, dist={gap_dist:.2f}m, angle={math.degrees(gap_angle):.1f}°")
+        return gaps
+    
+    def is_near_entry(self, pose, threshold=0.5):
+        # Check if robot is near entry point
+        if self.entry_pose is None:
+            return False
+        dx = pose[0] - self.entry_pose[0]
+        dy = pose[1] - self.entry_pose[1]
+        return math.sqrt(dx**2 + dy**2) < threshold
+    
+    def normalize_angle(self, angle):
+        while angle > math.pi:
+            angle -= 2 * math.pi
+        while angle < -math.pi:
+            angle += 2 * math.pi
+        return angle
+    
+    def wall_follow(self, side='right', wall_dist=0.15):
+        # Follow wall on side given at distance, avoiding obstacles
+        self.entry_pose = self.ekf.get_pose().copy()
+        steps_since_entry = 0
+        Kp = 0.5
+
+        # Follow wall until an exit
+        while True:
+            pose = self.ekf.get_pose()
+            result = self.ev3.scan(step=5)
+
+            if result is None:
+                print("Scan error")
+                continue
+
+            # Update ekf
+            points = self.scans.scan_to_cartesian(result['scan'], pose)
+            corners = self.scans.detect_corners(points)
+            observations = self.ekf.corners_to_observations(corners, pose)
+            self.ekf.update(observations)
+
+            # Check for gaps
+            gaps = self.detect_gaps(result, pose)
+
+            for gap in gaps:
+                # Skip if near entry - could be entry door
+                if steps_since_entry < 10 and self.is_near_entry(pose):
+                    print (" Ignoring gap near entry")
+                    continue
+
+                # Found potential exit
+                if gap['width'] > 0.3 and gap ['distance'] < 1.5:
+                    print(f"Exit Found at angle {math.degrees(gap['angle']):.1f}")
+                    return gap
+            
+            # Wall following logic
+            front_dist, right_dist, left_dist = self.get_distances(result, pose)
+
+            if front_dist < 0.15:
+                # Wall ahead - turn away
+                if side == 'right':
+                    self.rotate(-45)
+                else:
+                    self.rotate(45)
+            elif side == 'right':
+                if abs(right_dist-wall_dist) > 0.1:
+                    rot = Kp*(right_dist - wall_dist)
+                    self.rotate(rot)
+                    self.move(10)
+                else:
+                    self.move(10)
+            else: # left wall
+                if abs(left_dist-wall_dist) > 0.1:
+                    rot = Kp*(wall_dist - left_dist)
+                    self.rotate(rot)
+                    self.move(10)
+                else:
+                    self.move(10)
+            
+            steps_since_entry += 1
+    
+    def wall_follow_step(self, scan_result, pose, wall_dist=0.15, side='right', Kp=100):
+        """Execute one step of wall following, returns action taken"""
+        front_dist, right_dist, left_dist = self.get_distances(scan_result, pose)
+        print(f"  F={front_dist:.2f}m, R={right_dist:.2f}m, L={left_dist:.2f}m")
+        
+        if front_dist < 0.2:
+            # Wall ahead - turn away
+            if side == 'right':
+                print("  Wall ahead, turning left")
+                return ('rotate', -45)
+            else:
+                print("  Wall ahead, turning right")
+                return ('rotate', +45)
+        elif side == 'right':
+            if abs(right_dist - wall_dist) > 0.1:
+                rot = Kp * (right_dist - wall_dist)
+                print(f"  Adjusting: rotating {rot:.1f}° and moving")
+                return ('rotate_move', rot, 10)
+            else:
+                print("  Following wall")
+                return ('move', 10)
+        else:  # left wall
+            if abs(left_dist - wall_dist) > 0.1:
+                rot = Kp * (wall_dist - left_dist)
+                print(f"  Adjusting: rotating {rot:.1f}° and moving")
+                return ('rotate_move', rot, 10)
+            else:
+                print("  Following wall")
+                return ('move', 10)
+    
+    def get_distances(self, scan_result, pose):
+        # Get distances in front, right, left directions
+        points = self.scans.scan_to_cartesian(scan_result['scan'], pose)
+        rx, ry, rtheta = pose
+
+        front_dist = 2.0
+        right_dist = 2.0
+        left_dist = 2.0
+
+        for px, py in points:
+            dist = math.sqrt((px-rx)**2 + (py-ry)**2)
+            angle = self.normalize_angle(math.atan2(py-ry, px-rx)-rtheta)
+
+            # Front: -30 to +30 degrees
+            if abs(angle) < math.radians(30):
+                front_dist = min(front_dist, dist)
+            # Left: -60 to -120
+            elif -math.radians(120) < angle < -math.radians(60):
+                left_dist = min(left_dist, dist)
+            # Right: 60 to 120
+            elif math.radians(60) < angle < math.radians(120):
+                right_dist = min(right_dist, dist)
+        
+        return front_dist, right_dist, left_dist
+
+    def move(self, distance_cm):
+        result = self.ev3.move(left_speed=15, right_speed=15, distance_cm=distance_cm)
+        if result:
+            dx, dy, dtheta = self.scans.odometry(
+                result['odometry']['delta_left'],
+                result['odometry']['delta_right'],
+                self.ekf.get_pose()[2]
+            )
+            self.ekf.predict(dx, dy, dtheta)
+    
+    def rotate(self, angle_deg):
+        result = self.ev3.rotate(speed=10, angle_deg=angle_deg)
+        if result:
+            dx, dy, dtheta = self.scans.odometry(
+                result['odometry']['delta_left'],
+                result['odometry']['delta_right'],
+                self.ekf.get_pose()[2]
+            )
+            self.ekf.predict(dx, dy, dtheta)
+
+    def go_through_gap(self, gap, occ_grid=None, trajectory=None, plotter=None):
+        """Navigate through a detected gap while scanning for obstacles"""
+        print(f"Navigating to gap at ({gap['center'][0]:.2f}, {gap['center'][1]:.2f})")
+        
+        target_x, target_y = gap['center']
+        max_attempts = 20
+        
+        for attempt in range(max_attempts):
+            pose = self.ekf.get_pose()
+            rx, ry, rtheta = pose
+            
+            # Distance and angle to gap
+            dx = target_x - rx
+            dy = target_y - ry
+            dist_to_gap = math.sqrt(dx**2 + dy**2)
+            angle_to_gap = math.atan2(dy, dx)
+            angle_diff = self.normalize_angle(angle_to_gap - rtheta)
+            
+            print(f"  Attempt {attempt+1}: dist={dist_to_gap:.2f}m, angle={math.degrees(angle_diff):.1f}°")
+            
+            # Check if we've passed through
+            if dist_to_gap < 0.15:
+                print("  Reached gap center!")
+                # Move a bit more to clear the gap
+                self.move(20)
+                print("Passed through gap!")
+                return True
+            
+            # Scan for obstacles
+            result = self.ev3.scan(step=10)
+            if result is None:
+                print("  Scan error")
+                continue
+            
+            # Update EKF
+            points = self.scans.scan_to_cartesian(result['scan'], pose)
+            corners = self.scans.detect_corners(points)
+            observations = self.ekf.corners_to_observations(corners, pose)
+            self.ekf.update(observations)
+            
+            # Update occupancy grid and plotter if provided
+            if occ_grid is not None:
+                occ_grid.store_scan(result['scan'], pose)
+                occ_grid.update(pose, points)
+            if trajectory is not None:
+                trajectory.append(pose.copy())
+            if plotter is not None:
+                plotter.update(self.ekf, trajectory)
+            
+            # Get distances
+            front_dist, right_dist, left_dist = self.get_distances(result, pose)
+            print(f"  F={front_dist:.2f}m, R={right_dist:.2f}m, L={left_dist:.2f}m")
+            
+            # First, align toward gap if needed
+            if abs(angle_diff) > math.radians(20):
+                turn_angle = math.degrees(angle_diff)
+                # Limit turn amount
+                turn_angle = max(-45, min(45, turn_angle))
+                print(f"  Turning {turn_angle:.1f}° toward gap")
+                self.rotate(turn_angle)
+                continue
+            
+            # Check if path is clear
+            if front_dist < 0.20:
+                # Obstacle ahead - try to go around
+                print("  Obstacle ahead!")
+                
+                # Check which side has more room
+                if left_dist > right_dist:
+                    print("  Turning left to avoid")
+                    self.rotate(-30)
+                else:
+                    print("  Turning right to avoid")
+                    self.rotate(30)
+                
+                self.move(10)
+            else:
+                # Path is clear - move toward gap
+                move_dist = min(15, dist_to_gap * 100)  # cm, don't overshoot
+                move_dist = max(5, move_dist)  # at least 5cm
+                print(f"  Path clear, moving {move_dist:.0f}cm")
+                self.move(move_dist)
+        
+        print("  Max attempts reached, may not have passed through gap")
+        return False
+
 class OccupancyGrid:
     def __init__(self, size=5.0, resolution=0.02):
         # Size: total map size in meters
@@ -511,6 +787,8 @@ class OccupancyGrid:
         self.l_free = -0.4 # miss
         self.l_max = 5.0
         self.l_min = -5.0
+
+        self.scan_history = []
     
     def world_to_grid(self,x,y):
         # Convert world coordinates to grid indicie
@@ -527,6 +805,32 @@ class OccupancyGrid:
     def in_bounds(self,gx,gy):
         return 0 <= gx < self.n_cells and 0 <=gy < self.n_cells
     
+    def store_scan(self, raw_scan, pose):
+        # Store raw scan data for reconstruction
+        self.scan_history.append({
+            'raw_scan': [list(reading) for reading in raw_scan], # copy
+            'pose': list(pose) #x, y, theta at scan time
+        })
+    
+    def scan_to_world_points(self, raw_scan, pose):
+        """Convert raw scan to world coordinates using given pose"""
+        rx, ry, rtheta = pose
+        points = []
+        
+        for angle_deg, distance_cm in raw_scan:
+            if distance_cm > 150:  # Filter distant readings
+                continue
+            
+            angle_rad = math.radians(angle_deg)
+            local_x = (distance_cm / 100) * math.cos(angle_rad)
+            local_y = (distance_cm / 100) * math.sin(angle_rad)
+            
+            world_x = rx + local_x * math.cos(rtheta) - local_y * math.sin(rtheta)
+            world_y = ry + local_x * math.sin(rtheta) + local_y * math.cos(rtheta)
+            points.append((world_x, world_y))
+        
+        return points
+
     def update(self, pose, points):
         # Update grid with scan data
         rx, ry, _= pose
@@ -569,6 +873,41 @@ class OccupancyGrid:
                 err += dx
                 y += sy
     
+    def rebuild(self, pose_corrections=None):
+        # Rebuild map from stored scans
+        self.grid = np.zeros((self.n_cells, self.n_cells))
+
+        for i, scan_record in enumerate(self.scan_history):
+            # use corrected pose if available
+            if pose_corrections and i in pose_corrections:
+                pose = pose_corrections[i]
+            else:
+                pose = scan_record['pose']
+            
+            # Convert raw scan to world points
+            points = self.scan_to_world_points(scan_record['raw_scan'], pose)
+
+            # Update grid
+            self.update(pose, points)
+
+    def rebuild_with_ekf(self, trajectory):
+        if len(trajectory) != len(self.scan_history):
+            print(f"Warning: trajectory length ({len(trajectory)}) != scan history ({len(self.scan_history)})")
+            # Use minimum of both
+            n = min(len(trajectory), len(self.scan_history))
+        else:
+            n = len(trajectory)
+                
+        self.grid = np.zeros((self.n_cells, self.n_cells))
+        
+        for i in range(n):
+            pose = trajectory[i]
+            raw_scan = self.scan_history[i]['raw_scan']
+            points = self.scan_to_world_points(raw_scan, pose)
+            self.update(pose, points)
+        
+        print("Map rebuild complete")
+
     def get_probability_grid(self):
         # convert log odds to probability
         return 1 - 1/(1 + np.exp(self.grid))

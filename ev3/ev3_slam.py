@@ -34,12 +34,12 @@ def recv_json(sock):
 def do_scan(start_angle=-90, end_angle=90, step=10):
     """Sweep ultrasonic sensor and return list of [angle, distance_cm]"""
     readings = []
-    scan_motor.on_to_position(speed=10, position=start_angle, block=True)
+    scan_motor.on_to_position(speed=5, position=start_angle, block=True)
     time.sleep(0.2)
     
     for angle in range(start_angle, end_angle + 1, step):
         scan_motor.on_to_position(speed=10, position=angle, block=True)
-        time.sleep(0.5)  # let sensor settle
+        time.sleep(0.1)  # let sensor settle
         dist = ultrasonic.distance_centimeters
         readings.append([angle, dist])
     
