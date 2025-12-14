@@ -31,7 +31,7 @@ def recv_json(sock):
         return json.loads(buffer.decode("utf-8"))
     return None
 
-def do_scan(start_angle=-90, end_angle=90, step=10):
+def do_scan(start_angle=-120, end_angle=120, step=10):
     """Sweep ultrasonic sensor and return list of [angle, distance_cm]"""
     readings = []
     scan_motor.on_to_position(speed=5, position=start_angle, block=True)
@@ -154,8 +154,8 @@ def main():
             
             elif cmd["type"] == "scan":
                 scan_data = do_scan(
-                    cmd.get("start_angle", -90),
-                    cmd.get("end_angle", 90),
+                    cmd.get("start_angle", -120),
+                    cmd.get("end_angle", 120),
                     cmd.get("step", 10)
                 )
                 send_json(client_socket, {
@@ -170,8 +170,8 @@ def main():
                     cmd["distance_cm"]
                 )
                 scan_data = do_scan(
-                    cmd.get("start_angle", -90),
-                    cmd.get("end_angle", 90),
+                    cmd.get("start_angle", -120),
+                    cmd.get("end_angle", 120),
                     cmd.get("step", 10)
                 )
                 send_json(client_socket, {

@@ -51,7 +51,7 @@ class EV3Connection:
         })
         return self.recv()
     
-    def scan(self, start_angle=-90, end_angle=90, step=10):
+    def scan(self, start_angle=-120, end_angle=120, step=10):
         self.send({
             "type": "scan",
             "start_angle": start_angle,
@@ -61,7 +61,7 @@ class EV3Connection:
         return self.recv()
     
     def move_and_scan(self, left_speed, right_speed, distance_cm,
-                      start_angle=-90, end_angle=90, step=10):
+                      start_angle=-120, end_angle=120, step=10):
         self.send({
             "type": "move_and_scan",
             "left_speed": left_speed,
@@ -118,11 +118,11 @@ class Scans:
         points = []
 
         for angle_deg, distance_cm in scan:
-            if distance_cm > 100:   # Ignore readings above 150cm - unreliable
+            if distance_cm > 150:   # Ignore readings above 150cm - unreliable
                 continue
 
             # Convert to robot frame
-            angle_rad = math.radians(angle_deg)
+            angle_rad = math.radians(-angle_deg)
             local_x = (distance_cm/100) * math.cos(angle_rad)
             local_y = (distance_cm/100) * math.sin(angle_rad)
 
@@ -652,15 +652,15 @@ class Explorer:
             dist = math.sqrt((px-rx)**2 + (py-ry)**2)
             angle = self.normalize_angle(math.atan2(py-ry, px-rx)-rtheta)
 
-            # Front: -30 to +30 degrees
-            if abs(angle) < math.radians(30):
+            # Front: -45 to +45 degrees
+            if abs(angle) < math.radians(45):
                 front_dist = min(front_dist, dist)
-            # Left: -60 to -120
+            # Right: -60 to -120
             elif -math.radians(120) < angle < -math.radians(60):
-                left_dist = min(left_dist, dist)
-            # Right: 60 to 120
+                right_dist = min(left_dist, dist)
+            # Left: 60 to 120
             elif math.radians(60) < angle < math.radians(120):
-                right_dist = min(right_dist, dist)
+                left_dist = min(right_dist, dist)
         
         return front_dist, right_dist, left_dist
 
@@ -702,13 +702,12 @@ class Explorer:
             angle_to_gap = math.atan2(dy, dx)
             angle_diff = self.normalize_angle(angle_to_gap - rtheta)
             
-            print(f"  Attempt {attempt+1}: dist={dist_to_gap:.2f}m, angle={math.degrees(angle_diff):.1f}°")
+            print(f"  Attempt {attempt+1}: dist={dist_to_gap:.2f}m, angle_diff={math.degrees(angle_diff):.1f}°")
             
             # Check if we've passed through
             if dist_to_gap < 0.15:
                 print("  Reached gap center!")
-                # Move a bit more to clear the gap
-                self.move(20)
+                self.move(25)
                 print("Passed through gap!")
                 return True
             
@@ -737,38 +736,398 @@ class Explorer:
             front_dist, right_dist, left_dist = self.get_distances(result, pose)
             print(f"  F={front_dist:.2f}m, R={right_dist:.2f}m, L={left_dist:.2f}m")
             
-            # First, align toward gap if needed
-            if abs(angle_diff) > math.radians(20):
-                turn_angle = math.degrees(angle_diff)
-                # Limit turn amount
-                turn_angle = max(-45, min(45, turn_angle))
-                print(f"  Turning {turn_angle:.1f}° toward gap")
-                self.rotate(turn_angle)
-                continue
-            
-            # Check if path is clear
-            if front_dist < 0.20:
-                # Obstacle ahead - try to go around
-                print("  Obstacle ahead!")
-                
-                # Check which side has more room
+            # ALWAYS check for obstacle first, before turning or moving
+            if front_dist < 0.15:
+                print("  Obstacle ahead! Avoiding...")
                 if left_dist > right_dist:
-                    print("  Turning left to avoid")
                     self.rotate(-30)
                 else:
-                    print("  Turning right to avoid")
                     self.rotate(30)
-                
-                self.move(10)
+                continue  # Re-scan after avoiding
+            
+            # Now safe to turn or move
+            if abs(angle_diff) > math.radians(15):
+                turn_angle = -math.degrees(angle_diff)
+                print(f"  Turning {turn_angle:.1f}° toward gap")
+                self.rotate(turn_angle)
             else:
-                # Path is clear - move toward gap
-                move_dist = min(15, dist_to_gap * 100)  # cm, don't overshoot
-                move_dist = max(5, move_dist)  # at least 5cm
-                print(f"  Path clear, moving {move_dist:.0f}cm")
+                # Aligned and clear - move forward
+                move_dist = min(15, dist_to_gap * 100)
+                move_dist = max(5, move_dist)
+                print(f"  Moving {move_dist:.0f}cm toward gap")
                 self.move(move_dist)
         
-        print("  Max attempts reached, may not have passed through gap")
+        print("  Max attempts reached")
         return False
+
+class PathPlanner:
+    def __init__(self, occ_grid, robot_radius=0.10):
+        self.grid = occ_grid
+        self.robot_radius = robot_radius
+        self.inflated_grid = None
+    
+    def inflate_obstacles(self):
+        """Expand obstacles by robot radius for safe path planning"""
+        prob_grid = self.grid.get_probability_grid()
+        self.inflated_grid = prob_grid.copy()
+        
+        # How many cells to inflate
+        inflate_cells = int(self.robot_radius / self.grid.resolution) + 1
+        
+        print(f"  Inflating obstacles by {inflate_cells} cells ({self.robot_radius}m)")
+        
+        for y in range(self.grid.n_cells):
+            for x in range(self.grid.n_cells):
+                if prob_grid[y, x] > 0.6:  # Occupied cell
+                    # Mark nearby cells as occupied too
+                    for dy in range(-inflate_cells, inflate_cells + 1):
+                        for dx in range(-inflate_cells, inflate_cells + 1):
+                            ny, nx = y + dy, x + dx
+                            if self.grid.in_bounds(nx, ny):
+                                # Use circular inflation
+                                dist = math.sqrt(dx**2 + dy**2)
+                                if dist <= inflate_cells:
+                                    self.inflated_grid[ny, nx] = max(
+                                        self.inflated_grid[ny, nx], 
+                                        0.7
+                                    )
+    
+    def find_frontiers(self, pose):
+        """Find boundaries between free space and unknown space"""
+        prob_grid = self.grid.get_probability_grid()
+        frontiers = []
+        
+        # Free < 0.4, Unknown ~0.5, Occupied > 0.6
+        for y in range(1, self.grid.n_cells - 1):
+            for x in range(1, self.grid.n_cells - 1):
+                if prob_grid[y, x] < 0.4:  # Free cell
+                    # Check if adjacent to unknown
+                    for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                        ny, nx = y + dy, x + dx
+                        if 0.45 < prob_grid[ny, nx] < 0.55:  # Unknown
+                            wx, wy = self.grid.grid_to_world(x, y)
+                            frontiers.append((wx, wy))
+                            break
+        
+        if not frontiers:
+            return []
+        
+        # Cluster nearby frontier cells
+        clustered = self.cluster_frontiers(frontiers)
+        
+        # Sort by distance from robot
+        rx, ry = pose[0], pose[1]
+        clustered.sort(key=lambda f: math.sqrt((f[0] - rx)**2 + (f[1] - ry)**2))
+        
+        return clustered
+    
+    def cluster_frontiers(self, frontiers, cluster_dist=0.1):
+        """Group nearby frontier points into clusters, return centers"""
+        if not frontiers:
+            return []
+        
+        clusters = []
+        used = [False] * len(frontiers)
+        
+        for i, (fx, fy) in enumerate(frontiers):
+            if used[i]:
+                continue
+            
+            cluster = [(fx, fy)]
+            used[i] = True
+            
+            for j, (ox, oy) in enumerate(frontiers):
+                if not used[j]:
+                    dist = math.sqrt((fx - ox)**2 + (fy - oy)**2)
+                    if dist < cluster_dist:
+                        cluster.append((ox, oy))
+                        used[j] = True
+            
+            # Cluster center
+            cx = sum(p[0] for p in cluster) / len(cluster)
+            cy = sum(p[1] for p in cluster) / len(cluster)
+            clusters.append((cx, cy, len(cluster)))  # x, y, size
+        
+        # Filter small clusters and return as (x, y)
+        return [(c[0], c[1]) for c in clusters if c[2] >= 3]
+    
+    def find_gaps_in_grid(self, pose, min_gap_width=0.25):
+        """Find gaps in occupied cells that could be doors"""
+        prob_grid = self.grid.get_probability_grid()
+        rx, ry, rtheta = pose
+        gaps = []
+        
+        # Cast rays from robot position in all directions
+        for angle_deg in range(0, 360, 5):
+            angle = math.radians(angle_deg)
+            
+            # Cast ray and record what we hit
+            hit_wall = False
+            last_free_point = None
+            wall_start = None
+            wall_end = None
+            
+            for dist in np.arange(0.1, 1.5, self.grid.resolution):
+                wx = rx + dist * math.cos(angle)
+                wy = ry + dist * math.sin(angle)
+                gx, gy = self.grid.world_to_grid(wx, wy)
+                
+                if not self.grid.in_bounds(gx, gy):
+                    break
+                
+                prob = prob_grid[gy, gx]
+                
+                if prob < 0.4:  # Free
+                    last_free_point = (wx, wy, dist)
+                    if hit_wall:
+                        wall_end = dist
+                elif prob > 0.6:  # Occupied
+                    if not hit_wall:
+                        wall_start = dist
+                    hit_wall = True
+            
+            # If ray went through free space without hitting a wall, could be a gap
+            if last_free_point is not None and not hit_wall:
+                if last_free_point[2] > 0.3:  # At least 30cm of clear path
+                    gaps.append({
+                        'center': (last_free_point[0], last_free_point[1]),
+                        'angle': angle,
+                        'distance': last_free_point[2]
+                    })
+        
+        # Cluster nearby gaps
+        clustered_gaps = []
+        used = [False] * len(gaps)
+        
+        for i, gap in enumerate(gaps):
+            if used[i]:
+                continue
+            
+            cluster = [gap]
+            used[i] = True
+            
+            for j, other in enumerate(gaps):
+                if not used[j]:
+                    dist = math.sqrt(
+                        (gap['center'][0] - other['center'][0])**2 +
+                        (gap['center'][1] - other['center'][1])**2
+                    )
+                    if dist < 0.2:
+                        cluster.append(other)
+                        used[j] = True
+            
+            # Average the cluster
+            avg_x = sum(g['center'][0] for g in cluster) / len(cluster)
+            avg_y = sum(g['center'][1] for g in cluster) / len(cluster)
+            avg_dist = sum(g['distance'] for g in cluster) / len(cluster)
+            avg_angle = sum(g['angle'] for g in cluster) / len(cluster)
+            
+            clustered_gaps.append({
+                'center': (avg_x, avg_y),
+                'angle': avg_angle,
+                'distance': avg_dist,
+                'size': len(cluster)
+            })
+        
+        # Filter to significant gaps (multiple rays passed through)
+        significant = [g for g in clustered_gaps if g['size'] >= 3]
+        
+        return significant
+    
+    def astar(self, start_pose, goal, use_inflation=True):
+        """A* path planning on occupancy grid"""
+        import heapq
+        
+        # Inflate obstacles if needed
+        if use_inflation:
+            self.inflate_obstacles()
+            grid_to_use = self.inflated_grid
+        else:
+            grid_to_use = self.grid.get_probability_grid()
+        
+        start_gx, start_gy = self.grid.world_to_grid(start_pose[0], start_pose[1])
+        goal_gx, goal_gy = self.grid.world_to_grid(goal[0], goal[1])
+        
+        if not self.grid.in_bounds(start_gx, start_gy):
+            print("  Start out of bounds")
+            return None
+        if not self.grid.in_bounds(goal_gx, goal_gy):
+            print("  Goal out of bounds")
+            return None
+        
+        # Check if start or goal is in obstacle
+        if grid_to_use[start_gy, start_gx] > 0.5:
+            print("  Start is in obstacle!")
+            return None
+        if grid_to_use[goal_gy, goal_gx] > 0.5:
+            print("  Goal is in obstacle!")
+            return None
+        
+        def heuristic(a, b):
+            return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+        
+        def is_valid(x, y):
+            if not self.grid.in_bounds(x, y):
+                return False
+            return grid_to_use[y, x] < 0.5
+        
+        open_set = [(0, start_gx, start_gy)]
+        came_from = {}
+        g_score = {(start_gx, start_gy): 0}
+        
+        while open_set:
+            _, cx, cy = heapq.heappop(open_set)
+            
+            if (cx, cy) == (goal_gx, goal_gy):
+                # Reconstruct path
+                path = []
+                current = (goal_gx, goal_gy)
+                while current in came_from:
+                    wx, wy = self.grid.grid_to_world(current[0], current[1])
+                    path.append((wx, wy))
+                    current = came_from[current]
+                path.reverse()
+                return path
+            
+            # Skip if already processed with better score
+            if (cx, cy) in came_from and (cx, cy) != (start_gx, start_gy):
+                continue
+            
+            # 8-connected neighbors
+            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1), 
+                           (-1, -1), (-1, 1), (1, -1), (1, 1)]:
+                nx, ny = cx + dx, cy + dy
+                
+                if not is_valid(nx, ny):
+                    continue
+                
+                # Diagonal moves cost more
+                move_cost = 1.414 if dx != 0 and dy != 0 else 1.0
+                tentative_g = g_score[(cx, cy)] + move_cost
+                
+                if (nx, ny) not in g_score or tentative_g < g_score[(nx, ny)]:
+                    came_from[(nx, ny)] = (cx, cy)
+                    g_score[(nx, ny)] = tentative_g
+                    f_score = tentative_g + heuristic((nx, ny), (goal_gx, goal_gy))
+                    heapq.heappush(open_set, (f_score, nx, ny))
+        
+        print("  No path found")
+        return None
+    
+    def simplify_path(self, path, tolerance=0.1):
+        """Reduce path to key waypoints"""
+        if not path or len(path) < 3:
+            return path
+        
+        simplified = [path[0]]
+        
+        for i in range(1, len(path) - 1):
+            prev = simplified[-1]
+            curr = path[i]
+            next_pt = path[i + 1]
+            
+            # Check if direction changes significantly
+            dir1 = math.atan2(curr[1] - prev[1], curr[0] - prev[0])
+            dir2 = math.atan2(next_pt[1] - curr[1], next_pt[0] - curr[0])
+            
+            angle_diff = abs(dir1 - dir2)
+            if angle_diff > math.pi:
+                angle_diff = 2 * math.pi - angle_diff
+            
+            if angle_diff > 0.3:  # ~17 degrees
+                simplified.append(curr)
+        
+        simplified.append(path[-1])
+        return simplified
+    
+    def plot_inflated(self, pose=None, path=None, goal=None, filename=None):
+        """Visualize inflated grid with path"""
+        fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+        
+        extent = [-self.grid.size / 2, self.grid.size / 2,
+                  -self.grid.size / 2, self.grid.size / 2]
+        
+        # Original grid
+        axes[0].imshow(self.grid.get_probability_grid(), cmap='gray_r',
+                       origin='lower', extent=extent, vmin=0, vmax=1)
+        axes[0].set_title('Original Grid')
+        
+        # Inflated grid
+        if self.inflated_grid is not None:
+            axes[1].imshow(self.inflated_grid, cmap='gray_r',
+                           origin='lower', extent=extent, vmin=0, vmax=1)
+        else:
+            axes[1].imshow(self.grid.get_probability_grid(), cmap='gray_r',
+                           origin='lower', extent=extent, vmin=0, vmax=1)
+        axes[1].set_title(f'Inflated Grid (r={self.robot_radius}m)')
+        
+        for ax in axes:
+            if pose is not None:
+                ax.plot(pose[0], pose[1], 'bo', markersize=12, label='Robot')
+                # Draw robot radius circle
+                circle = plt.Circle((pose[0], pose[1]), self.robot_radius,
+                                     fill=False, color='blue', linestyle='--')
+                ax.add_patch(circle)
+            
+            if goal is not None:
+                ax.plot(goal[0], goal[1], 'r*', markersize=15, label='Goal')
+            
+            if path is not None and len(path) > 0:
+                px, py = zip(*path)
+                ax.plot(px, py, 'g-', linewidth=2, label='Path')
+                ax.plot(px[0], py[0], 'go', markersize=8)
+                ax.plot(px[-1], py[-1], 'gx', markersize=10)
+            
+            ax.set_aspect('equal')
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+            ax.set_xlabel('X (m)')
+            ax.set_ylabel('Y (m)')
+        
+        plt.tight_layout()
+        
+        if filename:
+            plt.savefig(filename)
+            print(f"  Saved {filename}")
+        plt.show()
+    
+    def plot_gaps(self, pose, gaps, filename=None):
+        """Visualize detected gaps"""
+        fig, ax = plt.subplots(figsize=(12, 12))
+        
+        extent = [-self.grid.size / 2, self.grid.size / 2,
+                  -self.grid.size / 2, self.grid.size / 2]
+        
+        ax.imshow(self.grid.get_probability_grid(), cmap='gray_r',
+                  origin='lower', extent=extent, vmin=0, vmax=1)
+        
+        rx, ry, rtheta = pose
+        ax.plot(rx, ry, 'bo', markersize=12, label='Robot')
+        
+        # Draw robot heading
+        ax.arrow(rx, ry, 0.1 * math.cos(rtheta), 0.1 * math.sin(rtheta),
+                 head_width=0.03, color='blue')
+        
+        # Draw gaps
+        for i, gap in enumerate(gaps):
+            gx, gy = gap['center']
+            ax.plot(gx, gy, 'g*', markersize=15)
+            ax.plot([rx, gx], [ry, gy], 'g--', linewidth=2)
+            ax.annotate(f"Gap {i + 1}\nd={gap['distance']:.2f}m",
+                        (gx, gy), textcoords='offset points',
+                        xytext=(10, 10), color='green')
+        
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.set_title('Detected Gaps')
+        
+        if filename:
+            plt.savefig(filename)
+            print(f"  Saved {filename}")
+        plt.show()
 
 class OccupancyGrid:
     def __init__(self, size=5.0, resolution=0.02):
@@ -821,7 +1180,7 @@ class OccupancyGrid:
             if distance_cm > 150:  # Filter distant readings
                 continue
             
-            angle_rad = math.radians(angle_deg)
+            angle_rad = math.radians(-angle_deg)
             local_x = (distance_cm / 100) * math.cos(angle_rad)
             local_y = (distance_cm / 100) * math.sin(angle_rad)
             
