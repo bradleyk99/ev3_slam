@@ -6,7 +6,7 @@ import time
 ev3 = EV3Connection("/dev/rfcomm0")
 scans = Scans()
 ekf = EKFSlam()
-occ_grid = OccupancyGrid(size=3.0, resolution=0.05)
+occ_grid = OccupancyGrid(size=6.0, resolution=0.1)
 trajectory = []
 plotter = LivePlotter(occ_grid)
 explorer = Explorer(ev3, scans, ekf)
@@ -226,6 +226,10 @@ try:
     max_steps = 50
     check_interval = 4  # Check for exits every N steps
     
+    # Scan then move forward
+    scan()
+    move(30)
+
     # Start with 360 degree scan
     for step in range(4):
         scan()
@@ -241,6 +245,7 @@ try:
         pose = ekf.get_pose()
         
         # Periodically check map for exit
+        '''
         if step > 3 and step % check_interval == 0:
             print("\n  --- Checking map for exits ---")
             gaps = find_exit_in_map()
@@ -252,9 +257,10 @@ try:
                 break
             else:
                 print("  No valid exits found yet, continuing exploration...")
+        '''
         
         # Wall follow to explore
-        action = explorer.wall_follow_step(result, pose, wall_dist=0.2, side='right')
+        action = explorer.wall_follow_step(result, pose, wall_dist=0.2, side='right',dist=20, Kp=250)
         execute_action(action)
         
         # Check if completed full loop

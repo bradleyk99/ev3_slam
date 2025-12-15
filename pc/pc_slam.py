@@ -83,7 +83,7 @@ class Scans:
     def __init__(self):
         # Robot parameters
         self.WHEEL_RADIUS = 0.0275 # meters
-        self.WHEEL_BASE = 0.107 # meters
+        self.WHEEL_BASE = 0.1 # meters
         self.TICKS_PER_REV = 360
 
     def ticks_to_meters(self, ticks):
@@ -305,7 +305,7 @@ class EKFSlam:
         # Covariance
         self.P = np.diag([0.1, 0.1, 0.1]) # Assume small initial uncertainty
         # Motion noise
-        self.Q = np.diag([0.001, 0.001, 0.02]) # x, y, theta variance per motion
+        self.Q = np.diag([0.001, 0.001, 0.1]) # x, y, theta variance per motion
         # Observation (measurement) noise
         self.R = np.diag([0.1,0.2]) # range, bearing variance
 
@@ -613,12 +613,12 @@ class Explorer:
             
             steps_since_entry += 1
     
-    def wall_follow_step(self, scan_result, pose, wall_dist=0.15, side='right', Kp=100):
+    def wall_follow_step(self, scan_result, pose, wall_dist=0.15, side='right', Kp=100, dist=10):
         """Execute one step of wall following, returns action taken"""
         front_dist, right_dist, left_dist = self.get_distances(scan_result, pose)
         print(f"  F={front_dist:.2f}m, R={right_dist:.2f}m, L={left_dist:.2f}m")
         
-        if front_dist < 0.2:
+        if front_dist < (dist*1.5/100):
             # Wall ahead - turn away
             if side == 'right':
                 print("  Wall ahead, turning left")
@@ -626,22 +626,24 @@ class Explorer:
             else:
                 print("  Wall ahead, turning right")
                 return ('rotate', +45)
+            
+            
         elif side == 'right':
             if abs(right_dist - wall_dist) > 0.1:
                 rot = Kp * (right_dist - wall_dist)
                 print(f"  Adjusting: rotating {rot:.1f}° and moving")
-                return ('rotate_move', rot, 10)
+                return ('rotate_move', rot, dist)
             else:
                 print("  Following wall")
-                return ('move', 10)
+                return ('move', dist)
         else:  # left wall
             if abs(left_dist - wall_dist) > 0.1:
                 rot = Kp * (wall_dist - left_dist)
                 print(f"  Adjusting: rotating {rot:.1f}° and moving")
-                return ('rotate_move', rot, 10)
+                return ('rotate_move', rot, dist)
             else:
                 print("  Following wall")
-                return ('move', 10)
+                return ('move', dist)
     
     def get_distances(self, scan_result, pose):
         # Get distances in front, right, left directions
@@ -656,8 +658,8 @@ class Explorer:
             dist = math.sqrt((px-rx)**2 + (py-ry)**2)
             angle = self.normalize_angle(math.atan2(py-ry, px-rx)-rtheta)
 
-            # Front: -45 to +45 degrees
-            if abs(angle) < math.radians(45):
+            # Front: -30 to +30 degrees
+            if abs(angle) < math.radians(30):
                 front_dist = min(front_dist, dist)
             # Right: -60 to -120
             elif -math.radians(120) < angle < -math.radians(60):
