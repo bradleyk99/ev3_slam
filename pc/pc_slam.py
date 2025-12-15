@@ -489,6 +489,10 @@ class EKFSlam:
             dx = cx - rx
             dy = cy - ry
             r = np.sqrt(dx**2 + dy**2)
+
+            if r > 1.5: # Reject corners detected further than the reliable distance
+                print(f"Rejecting corner at ({cx:.2f}, {cy:.2f}) - Too far r = {r:.2f}")
+
             b = np.arctan2(dy, dx) - rtheta
             observations.append((r,b))
 
@@ -851,21 +855,18 @@ class PathPlanner:
         # Filter small clusters and return as (x, y)
         return [(c[0], c[1]) for c in clusters if c[2] >= 3]
     
-    def find_gaps_in_grid(self, pose, min_gap_width=0.25):
-        """Find gaps in occupied cells that could be doors"""
+    def find_gaps_in_grid(self, pose, min_gap_width=0.20):
+        """Find actual openings in walls, not just unexplored areas"""
         prob_grid = self.grid.get_probability_grid()
         rx, ry, rtheta = pose
-        gaps = []
         
-        # Cast rays from robot position in all directions
-        for angle_deg in range(0, 360, 5):
+        # For each ray, record: did it hit a wall, and at what distance?
+        ray_results = []
+        
+        for angle_deg in range(0, 360, 3):  # Finer resolution
             angle = math.radians(angle_deg)
             
-            # Cast ray and record what we hit
-            hit_wall = False
-            last_free_point = None
-            wall_start = None
-            wall_end = None
+            wall_dist = None
             
             for dist in np.arange(0.1, 1.5, self.grid.resolution):
                 wx = rx + dist * math.cos(angle)
@@ -877,23 +878,50 @@ class PathPlanner:
                 
                 prob = prob_grid[gy, gx]
                 
-                if prob < 0.4:  # Free
-                    last_free_point = (wx, wy, dist)
-                    if hit_wall:
-                        wall_end = dist
-                elif prob > 0.6:  # Occupied
-                    if not hit_wall:
-                        wall_start = dist
-                    hit_wall = True
+                if prob > 0.6:  # Hit wall
+                    wall_dist = dist
+                    break
             
-            # If ray went through free space without hitting a wall, could be a gap
-            if last_free_point is not None and not hit_wall:
-                if last_free_point[2] > 0.3:  # At least 30cm of clear path
-                    gaps.append({
-                        'center': (last_free_point[0], last_free_point[1]),
-                        'angle': angle,
-                        'distance': last_free_point[2]
-                    })
+            ray_results.append({
+                'angle': angle,
+                'angle_deg': angle_deg,
+                'wall_dist': wall_dist  # None if no wall hit
+            })
+        
+        # Find gaps: sequences where neighboring rays hit walls, 
+        # but middle rays don't (or hit walls much further away)
+        gaps = []
+        n_rays = len(ray_results)
+        
+        for i in range(n_rays):
+            # Look for pattern: wall - no wall - wall
+            prev_idx = (i - 5) % n_rays  # ~15 degrees back
+            next_idx = (i + 5) % n_rays  # ~15 degrees forward
+            
+            prev_ray = ray_results[prev_idx]
+            curr_ray = ray_results[i]
+            next_ray = ray_results[next_idx]
+            
+            # Check if neighbors hit walls but current doesn't (or hits much further)
+            prev_has_wall = prev_ray['wall_dist'] is not None and prev_ray['wall_dist'] < 1.0
+            next_has_wall = next_ray['wall_dist'] is not None and next_ray['wall_dist'] < 1.0
+            curr_no_wall = curr_ray['wall_dist'] is None or curr_ray['wall_dist'] > 1.2
+            
+            if prev_has_wall and next_has_wall and curr_no_wall:
+                # This looks like a gap - opening between two walls
+                angle = curr_ray['angle']
+                
+                # Gap distance is average of neighboring wall distances
+                gap_dist = (prev_ray['wall_dist'] + next_ray['wall_dist']) / 2
+                
+                gap_x = rx + gap_dist * math.cos(angle)
+                gap_y = ry + gap_dist * math.sin(angle)
+                
+                gaps.append({
+                    'center': (gap_x, gap_y),
+                    'angle': angle,
+                    'distance': gap_dist
+                })
         
         # Cluster nearby gaps
         clustered_gaps = []
@@ -912,7 +940,7 @@ class PathPlanner:
                         (gap['center'][0] - other['center'][0])**2 +
                         (gap['center'][1] - other['center'][1])**2
                     )
-                    if dist < 0.2:
+                    if dist < 0.25:
                         cluster.append(other)
                         used[j] = True
             
@@ -929,8 +957,8 @@ class PathPlanner:
                 'size': len(cluster)
             })
         
-        # Filter to significant gaps (multiple rays passed through)
-        significant = [g for g in clustered_gaps if g['size'] >= 3]
+        # Filter to significant gaps (multiple rays)
+        significant = [g for g in clustered_gaps if g['size'] >= 2]
         
         return significant
     

@@ -6,7 +6,7 @@ import time
 ev3 = EV3Connection("/dev/rfcomm0")
 scans = Scans()
 ekf = EKFSlam()
-occ_grid = OccupancyGrid(size=3.0, resolution=0.03)
+occ_grid = OccupancyGrid(size=3.0, resolution=0.05)
 trajectory = []
 plotter = LivePlotter(occ_grid)
 explorer = Explorer(ev3, scans, ekf)
@@ -162,7 +162,7 @@ def find_exit_in_map():
             (gap['center'][0] - explorer.entry_pose[0])**2 +
             (gap['center'][1] - explorer.entry_pose[1])**2
         )
-        if dist_to_entry > 0.4:
+        if dist_to_entry > 0.2:
             valid_gaps.append(gap)
             print(f"    Gap at ({gap['center'][0]:.2f}, {gap['center'][1]:.2f}), dist={gap['distance']:.2f}m")
         else:
