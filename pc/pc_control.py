@@ -148,8 +148,8 @@ def find_exit_in_map():
     pose = ekf.get_pose()
     
     # Rebuild map with corrected poses
-    print("  Rebuilding map...")
-    occ_grid.rebuild_with_ekf(trajectory)
+    #print("  Rebuilding map...")
+    #occ_grid.rebuild_with_ekf(trajectory)
     
     # Find gaps
     gaps = path_planner.find_gaps_in_grid(pose)
@@ -220,21 +220,23 @@ def navigate_to_exit(goal):
 
 # ============= MAIN =============
 try:
-    print("=== Phase 1: Exploration ===\n")
+    
     
     exit_found = None
     max_steps = 50
-    check_interval = 4  # Check for exits every N steps
+    check_interval = 3  # Check for exits every N steps
     
     # Scan then move forward
-    scan()
+    print("Preparing to enter arena")
     move(30)
 
     # Start with 360 degree scan
+    print("Scanning surroundings...")
     for step in range(4):
         scan()
         rotate(angle=90)
 
+    print("=== Phase 1: Exploration ===\n")
     for step in range(max_steps):
         print(f"Step {step + 1}")
         
@@ -245,22 +247,21 @@ try:
         pose = ekf.get_pose()
         
         # Periodically check map for exit
-        '''
+        
         if step > 3 and step % check_interval == 0:
             print("\n  --- Checking map for exits ---")
             gaps = find_exit_in_map()
-            
+ 
             if gaps:
                 # Use closest gap
                 exit_found = gaps[0]
                 print(f"  Exit selected at ({exit_found['center'][0]:.2f}, {exit_found['center'][1]:.2f})")
-                break
+                #break
             else:
                 print("  No valid exits found yet, continuing exploration...")
-        '''
         
         # Wall follow to explore
-        action = explorer.wall_follow_step(result, pose, wall_dist=0.2, side='right',dist=20, Kp=250)
+        action = explorer.wall_follow_step(result, pose, wall_dist=0.25, side='right',dist=25, Kp=200)
         execute_action(action)
         
         # Check if completed full loop
@@ -294,7 +295,7 @@ try:
         pose = ekf.get_pose()
         all_gaps = path_planner.find_gaps_in_grid(pose)
         if all_gaps:
-            path_planner.plot_gaps(pose, all_gaps, filename='detected_gaps.png')
+            path_planner.plot_gaps(pose, all_gaps)
         
         # Navigate to exit
         success = navigate_to_exit(exit_found)
@@ -325,6 +326,5 @@ except KeyboardInterrupt:
     ev3.stop()
 
 finally:
-    plotter.close()
     ev3.close()
     print("Done")

@@ -118,7 +118,7 @@ class Scans:
         points = []
 
         for angle_deg, distance_cm in scan:
-            if distance_cm > 150:   # Ignore readings above 150cm - unreliable
+            if distance_cm > 100:   # Ignore readings above 150cm - unreliable
                 continue
 
             # Convert to robot frame
@@ -183,7 +183,7 @@ class Scans:
         intersection = p1 + t * d1
         return intersection
 
-    def detect_corners(self, points, distance_threshold=0.15, angle_threshold=10):
+    def detect_corners(self, points, distance_threshold=0.25, angle_threshold=45):
         segments = self.segment_scan(points, distance_threshold)
         print(f"  Segments: {len(segments)}, sizes: {[len(s) for s in segments]}")
 
@@ -215,7 +215,7 @@ class Scans:
                         math.sqrt((intersection[0]-seg2[0][0])**2 + (intersection[1]-seg2[0][1])**2),
                         math.sqrt((intersection[0]-seg2[-1][0])**2 + (intersection[1]-seg2[-1][1])**2),
                     ]
-                    if min(dists) < 0.25:
+                    if min(dists) < 0.2:
                         corners.append(tuple(intersection))
         
         return corners
@@ -305,12 +305,12 @@ class EKFSlam:
         # Covariance
         self.P = np.diag([0.1, 0.1, 0.1]) # Assume small initial uncertainty
         # Motion noise
-        self.Q = np.diag([0.001, 0.001, 0.1]) # x, y, theta variance per motion
+        self.Q = np.diag([0.01, 0.01, 0.5]) # x, y, theta variance per motion
         # Observation (measurement) noise
-        self.R = np.diag([0.1,0.2]) # range, bearing variance
+        self.R = np.diag([0.2,0.4]) # range, bearing variance
 
         # Data association threshold
-        self.association_threshold = 0.6 # meters
+        self.association_threshold = 1.0 # meters
 
         # Number of landmarks 
         self.n_landmarks = 0
@@ -629,16 +629,20 @@ class Explorer:
             
             
         elif side == 'right':
-            if abs(right_dist - wall_dist) > 0.1:
+            if abs(right_dist - wall_dist) > 0.05:
                 rot = Kp * (right_dist - wall_dist)
+                if abs(rot > 90):
+                    rot = np.sign(rot)*90
                 print(f"  Adjusting: rotating {rot:.1f}° and moving")
-                return ('rotate_move', rot, dist)
+                return('rotate_move', rot, dist)
             else:
                 print("  Following wall")
                 return ('move', dist)
         else:  # left wall
-            if abs(left_dist - wall_dist) > 0.1:
+            if abs(left_dist - wall_dist) > 0.05:
                 rot = Kp * (wall_dist - left_dist)
+                if abs(rot > 90):
+                    rot = np.sign(rot)*90
                 print(f"  Adjusting: rotating {rot:.1f}° and moving")
                 return ('rotate_move', rot, dist)
             else:
