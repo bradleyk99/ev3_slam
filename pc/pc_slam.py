@@ -478,23 +478,25 @@ class EKFSlam:
         self.n_landmarks = 0
     
     def predict(self, dx, dy, dtheta):
-        # Prediction step using odometry
         # Update robot pose
         self.state[0] += dx
         self.state[1] += dy
         self.state[2] += dtheta
         self.state[2] = self.normalize_angle(self.state[2])
 
-        # Jacobian of motion model wrt state
+        # Jacobian
         n = len(self.state)
-        F = np.eye(n)       # dx and dy are already provided in world frame so F is identity
+        F = np.eye(n)
 
-        # expand Q to full state space
-        Q_full = np.zeros((n,n))
+        # Expand Q
+        Q_full = np.zeros((n, n))
         Q_full[:3, :3] = self.Q
 
         # Update covariance
         self.P = F @ self.P @ F.T + Q_full
+        
+        # ENFORCE SYMMETRY
+        self.P = (self.P + self.P.T) / 2
 
     def update(self, observations):
         # Update step using corner observations
@@ -517,32 +519,110 @@ class EKFSlam:
                 self.update_landmark(landmark_idx, r, b)
         
     def associate_landmark(self, lx, ly):
-        # Find nearest landmark within a threshold or None if new
+        """Find nearest landmark using Mahalanobis distance with Euclidean fallback"""
         if self.n_landmarks == 0:
             return None
         
-        # initialize as defaults
-        min_dist = float('inf')
+        rx, ry, rtheta = self.state[:3]
+        min_mahal_dist = float('inf')
+        min_euclidean_dist = float('inf')
         best_idx = None
 
-        # Check all landmarks to see which is closest
         for i in range(self.n_landmarks):
             idx = 3 + i*2
-            dx = self.state[idx] - lx
-            dy = self.state[idx + 1] - ly
-            dist = np.sqrt(dx**2 + dy**2)
-
-            if dist < min_dist:
-                min_dist = dist
+            lx_est = self.state[idx]
+            ly_est = self.state[idx + 1]
+            
+            # Euclidean distance (ground truth proximity)
+            euclidean_dist = np.sqrt((lx - lx_est)**2 + (ly - ly_est)**2)
+            
+            # Predicted observation
+            dx_pred = lx_est - rx
+            dy_pred = ly_est - ry
+            r_pred = np.sqrt(dx_pred**2 + dy_pred**2)
+            
+            if r_pred < 1e-6:
+                continue
+                
+            b_pred = np.arctan2(dy_pred, dx_pred) - rtheta
+            b_pred = self.normalize_angle(b_pred)
+            
+            # Actual observation
+            dx_obs = lx - rx
+            dy_obs = ly - ry
+            r_obs = np.sqrt(dx_obs**2 + dy_obs**2)
+            b_obs = np.arctan2(dy_obs, dx_obs) - rtheta
+            b_obs = self.normalize_angle(b_obs)
+            
+            # Innovation in observation space
+            innovation = np.array([r_obs - r_pred, self.normalize_angle(b_obs - b_pred)])
+            
+            n = len(self.state)
+            H = np.zeros((2, n))
+            
+            # Jacobian w.r.t robot pose
+            H[0, 0] = -dx_pred / r_pred
+            H[0, 1] = -dy_pred / r_pred
+            H[0, 2] = 0
+            H[1, 0] = dy_pred / (r_pred**2)
+            H[1, 1] = -dx_pred / (r_pred**2)
+            H[1, 2] = -1
+            
+            # Jacobian w.r.t landmark
+            H[0, idx] = dx_pred / r_pred
+            H[0, idx+1] = dy_pred / r_pred
+            H[1, idx] = -dy_pred / (r_pred**2)
+            H[1, idx+1] = dx_pred / (r_pred**2)
+            
+            # Innovation covariance
+            S = H @ self.P @ H.T + self.R
+            
+            # Mahalanobis distance
+            try:
+                # Ensure S is symmetric
+                S = (S + S.T) / 2
+                S_inv = np.linalg.inv(S)
+                mahal_sq = innovation.T @ S_inv @ innovation
+                
+                if mahal_sq < 0:
+                    mahal_dist = 999  # Invalid, will use Euclidean
+                else:
+                    mahal_dist = np.sqrt(mahal_sq)
+                    
+            except np.linalg.LinAlgError:
+                mahal_dist = 999  # Invalid, will use Euclidean
+            
+            # Track best by both metrics
+            if mahal_dist < min_mahal_dist:
+                min_mahal_dist = mahal_dist
                 best_idx = i
+            if euclidean_dist < min_euclidean_dist:
+                min_euclidean_dist = euclidean_dist
         
-        print(f"    Observed corner at ({lx:.3f}, {ly:.3f}), nearest landmark L{best_idx+1} at dist {min_dist:.3f}m")
+        # Get the best candidate's Euclidean distance
+        best_euclidean = np.sqrt((lx - self.state[3 + best_idx*2])**2 + 
+                                (ly - self.state[3 + best_idx*2 + 1])**2)
         
-        if min_dist < self.association_threshold:
-            print(f"    -> Associated with L{best_idx+1}")
+        print(f"    Observed corner at ({lx:.3f}, {ly:.3f}), nearest landmark L{best_idx+1}")
+        print(f"      Euclidean dist: {best_euclidean:.3f}m, Mahalanobis dist: {min_mahal_dist:.3f}")
+        
+        # Two-stage decision:
+        # 1. If Mahalanobis is good, associate
+        if min_mahal_dist < 1.0:
+            print(f"    -> Associated with L{best_idx+1} (Mahalanobis < 1.0)")
             return best_idx
-        print(f"    -> New landmark (threshold {self.association_threshold})")
+        
+        # 2. If Mahalanobis failed BUT Euclidean is very small, still associate
+        # This catches cases where EKF uncertainty is wrong
+        euclidean_threshold = 0.20  # 20cm - definitely same landmark
+        if best_euclidean < euclidean_threshold:
+            print(f"    -> Associated with L{best_idx+1} (Euclidean < {euclidean_threshold}m override)")
+            return best_idx
+        
+        # Otherwise, new landmark
+        print(f"     -> New landmark (Mahal={min_mahal_dist:.2f} > 1.0, Eucl={best_euclidean:.2f} > {euclidean_threshold})")
         return None
+        
     
     def add_landmark(self, lx, ly):
         # Add new landmark to state
@@ -577,7 +657,6 @@ class EKFSlam:
         print(f"Added Landmark {self.n_landmarks}: ({lx:.3f}, {ly:.3f})")
     
     def update_landmark(self, landmark_idx, r_obs, b_obs):
-        # EKF Update for observing existing landmark
         idx = 3 + landmark_idx*2
         lx, ly = self.state[idx], self.state[idx+1]
         rx, ry, rtheta = self.state[:3]
@@ -591,37 +670,41 @@ class EKFSlam:
         # Innovation
         z = np.array([r_obs - r_pred, self.normalize_angle(b_obs - b_pred)])
 
-        # Innovation gating - reject if too large
+        # Innovation gating
         if abs(z[0]) > 0.5 or abs(z[1]) > np.radians(45):
             print(f"    Rejected update: innovation too large (dr={z[0]:.3f}, db={np.degrees(z[1]):.1f}°)")
             return
 
-        # Jacobian of observation model
+        # Jacobian
         n = len(self.state)
-        H = np.zeros((2,n))
+        H = np.zeros((2, n))
+        H[0, 0] = -dx / r_pred
+        H[0, 1] = -dy / r_pred
+        H[0, 2] = 0
+        H[1, 0] = dy / (r_pred**2)
+        H[1, 1] = -dx / (r_pred**2)
+        H[1, 2] = -1
+        H[0, idx] = dx / r_pred
+        H[0, idx+1] = dy / r_pred
+        H[1, idx] = -dy / (r_pred**2)
+        H[1, idx+1] = dx / (r_pred**2)
 
-        # wrt robot pose
-        H[0, 0] = -dx / r_pred  # dr/drx
-        H[0, 1] = -dy / r_pred  # dr/dry
-        H[0, 2] = 0             # dr/dtheta
-        H[1, 0] = dy / (r_pred**2)   # db/drx
-        H[1, 1] = -dx / (r_pred**2)  # db/dry
-        H[1, 2] = -1                  # db/dtheta
-
-        # w.r.t landmark
-        H[0, idx] = dx / r_pred      # dr/dlx
-        H[0, idx + 1] = dy / r_pred  # dr/dly
-        H[1, idx] = -dy / (r_pred**2)     # db/dlx
-        H[1, idx + 1] = dx / (r_pred**2)  # db/dly
-
-        # Kalman gain
+        # Innovation covariance
         S = H @ self.P @ H.T + self.R
+        
+        # Kalman gain
         K = self.P @ H.T @ np.linalg.inv(S)
         
-        # Update state and covariance
+        # Update state
         self.state = self.state + K @ z
         self.state[2] = self.normalize_angle(self.state[2])
-        self.P = (np.eye(n) - K @ H) @ self.P
+        
+        # Update covariance using JOSEPH FORM (numerically stable)
+        I_KH = np.eye(n) - K @ H
+        self.P = I_KH @ self.P @ I_KH.T + K @ self.R @ K.T
+        
+        # ENFORCE SYMMETRY
+        self.P = (self.P + self.P.T) / 2
 
     def normalize_angle(self, angle):
         """Keep angle between -pi and pi"""
@@ -780,15 +863,14 @@ class Explorer:
         front_dist, right_dist, left_dist = self.get_distances(scan_result, pose)
         print(f"  F={front_dist:.2f}m, R={right_dist:.2f}m, L={left_dist:.2f}m")
         
-        if front_dist < (dist*1.5/100):
+        if front_dist < (dist*2/100):
             # Wall ahead - turn away
             if side == 'right':
                 print("  Wall ahead, turning left")
-                
-                return ('rotate_move', -45, -dist/2)
+                return ('rotate_move', -45, -1*dist/2)
             else:
                 print("  Wall ahead, turning right")
-                return ('rotate_move', +45, -dist/2)
+                return ('rotate_move', +45, -1*dist/2)
             
             
         elif side == 'right':
