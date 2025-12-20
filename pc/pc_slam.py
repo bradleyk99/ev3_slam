@@ -116,13 +116,16 @@ class Scans:
         # Convert scan to coordinates
         rx, ry, rtheta = pose
         points = []
+        max_range_angles = []
 
         for angle_deg, distance_cm in scan:
-            if distance_cm > 100:   # Ignore readings above 150cm - unreliable
+            angle_rad = math.radians(-angle_deg)
+
+            if distance_cm > 100:   # Values above a threshold detect empty
+                max_range_angles.append(angle_rad)
                 continue
 
             # Convert to robot frame
-            angle_rad = math.radians(-angle_deg)
             local_x = (distance_cm/100) * math.cos(angle_rad)
             local_y = (distance_cm/100) * math.sin(angle_rad)
 
@@ -131,10 +134,16 @@ class Scans:
             world_y = ry + local_x * math.sin(rtheta) + local_y * math.cos(rtheta)
             points.append((world_x, world_y))
         
-        return points
+        return points, max_range_angles
     
-    def segment_scan(self, points, distance_threshold=0.05):
-        # Split points into segments based on gaps (walls)
+    def segment_scan(self, points, distance_threshold=0.08, angle_threshold=20):
+        """
+        Split points into segments based on gaps AND direction changes
+        
+        Args:
+            distance_threshold: Max distance between consecutive points (meters)
+            angle_threshold: Max angle change between consecutive point directions (degrees)
+        """
         if len(points) < 2:
             return []
         
@@ -142,38 +151,103 @@ class Scans:
         current_segment = [points[0]]
 
         for i in range(1, len(points)):
-            dist = math.sqrt((points[i][0] - points[i-1][0])**2 + (points[i][1] - points[i-1][1])**2)
+            # Distance between consecutive points
+            dist = math.sqrt((points[i][0] - points[i-1][0])**2 + 
+                            (points[i][1] - points[i-1][1])**2)
+            
+            # Direction change check (if we have enough points)
+            angle_change = 0
+            if len(current_segment) >= 2:
+                # Vector from second-to-last to last point in current segment
+                v1_x = current_segment[-1][0] - current_segment[-2][0]
+                v1_y = current_segment[-1][1] - current_segment[-2][1]
+                
+                # Vector from last point to new point
+                v2_x = points[i][0] - current_segment[-1][0]
+                v2_y = points[i][1] - current_segment[-1][1]
+                
+                # Angle between vectors
+                norm1 = math.sqrt(v1_x**2 + v1_y**2)
+                norm2 = math.sqrt(v2_x**2 + v2_y**2)
+                
+                if norm1 > 1e-6 and norm2 > 1e-6:
+                    dot = (v1_x * v2_x + v1_y * v2_y) / (norm1 * norm2)
+                    dot = max(-1, min(1, dot))  # Clamp to [-1, 1]
+                    angle_change = math.degrees(math.acos(dot))
 
-            if dist < distance_threshold:
-                current_segment.append(points[i])
-            else:
+            # Break segment if distance too large OR direction changed too much
+            if dist > distance_threshold or angle_change > angle_threshold:
                 if len(current_segment) >= 3:
                     segments.append(current_segment)
                 current_segment = [points[i]]
+            else:
+                current_segment.append(points[i])
         
         if len(current_segment) >= 3:
             segments.append(current_segment)
         
         return segments
     
-    def fit_line(self, segment):
-        # Fit a line to points in a segment of points, return line as point and direction
-        points = np.array(segment)
-        centroid = np.mean(points, axis=0)
+    def fit_line(self, segment, max_iterations=100, threshold=0.03):
+        """Fit a line to points using RANSAC - more robust than PCA"""
+        if len(segment) < 2:
+            return None, None
         
-        # PCA to find line direction
-        centered = points - centroid
+        points = np.array(segment)
+        best_inliers = []
+        best_model = None
+        
+        for _ in range(max_iterations):
+            # Randomly sample 2 points
+            if len(points) < 2:
+                break
+            idx = np.random.choice(len(points), 2, replace=False)
+            p1, p2 = points[idx]
+            
+            # Fit line through these points
+            direction = p2 - p1
+            direction_norm = np.linalg.norm(direction)
+            if direction_norm < 1e-6:
+                continue
+            direction = direction / direction_norm
+            
+            # Count inliers (points close to this line)
+            inliers = []
+            for i, p in enumerate(points):
+                # Distance from point to line
+                v = p - p1
+                projection = np.dot(v, direction) * direction
+                perpendicular = v - projection
+                dist = np.linalg.norm(perpendicular)
+                
+                if dist < threshold:
+                    inliers.append(i)
+            
+            # Keep best model
+            if len(inliers) > len(best_inliers):
+                best_inliers = inliers
+                best_model = (p1, direction)
+        
+        if not best_inliers or len(best_inliers) < 2:
+            return None, None
+        
+        # Refit line using all inliers for better accuracy
+        inlier_points = points[best_inliers]
+        centroid = np.mean(inlier_points, axis=0)
+        
+        # PCA on inliers only
+        centered = inlier_points - centroid
         cov = np.cov(centered.T)
         eigenvalues, eigenvectors = np.linalg.eig(cov)
         direction = eigenvectors[:, np.argmax(eigenvalues)]
-
+        
         return centroid, direction
     
     def line_intersection(self, p1, d1, p2, d2):
-        # Find intersections of two lines defined by point and direction
+        """Find intersection of two lines defined by point and direction"""
         # Solving p1 + t*d1 = p2 + s*d2
         A = np.array([[d1[0], -d2[0]], 
-                  [d1[1], -d2[1]]])
+                    [d1[1], -d2[1]]])
         b = np.array([p2[0] - p1[0], p2[1] - p1[1]])
         
         if abs(np.linalg.det(A)) < 1e-6:
@@ -183,42 +257,90 @@ class Scans:
         intersection = p1 + t * d1
         return intersection
 
-    def detect_corners(self, points, distance_threshold=0.25, angle_threshold=45):
-        segments = self.segment_scan(points, distance_threshold)
+    def detect_corners(self, points, distance_threshold=0.15, angle_threshold=45):
+        """Enhanced corner detection using RANSAC for line fitting"""
+        segments = self.segment_scan(points, distance_threshold, angle_threshold=45)
         print(f"  Segments: {len(segments)}, sizes: {[len(s) for s in segments]}")
 
         if len(segments) < 2:
             return []
         
+        # Fit lines to segments using RANSAC
         lines = []
         for seg in segments:
-            centroid, direction = self.fit_line(seg)
-            lines.append((centroid, direction, seg))
-
+            if len(seg) < 3:  # Need minimum points for RANSAC
+                continue
+            
+            centroid, direction = self.fit_line(seg, max_iterations=50, threshold=0.02)
+            if centroid is not None and direction is not None:
+                lines.append((centroid, direction, seg))
+        
+        if len(lines) < 2:
+            return []
+        
         corners = []
-        # Check ALL pairs of segments, not just adjacent
+        
+        # Check ALL pairs of segments for corners
         for i in range(len(lines)):
             for j in range(i + 1, len(lines)):
                 p1, d1, seg1 = lines[i]
                 p2, d2, seg2 = lines[j]
 
+                # Check angle between lines
                 angle = math.degrees(math.acos(min(1, abs(np.dot(d1, d2)))))
                 if angle < angle_threshold:
                     continue
 
                 intersection = self.line_intersection(p1, d1, p2, d2)
-                if intersection is not None:
-                    # Check if corner is near either segment's endpoints
-                    dists = [
-                        math.sqrt((intersection[0]-seg1[0][0])**2 + (intersection[1]-seg1[0][1])**2),
-                        math.sqrt((intersection[0]-seg1[-1][0])**2 + (intersection[1]-seg1[-1][1])**2),
-                        math.sqrt((intersection[0]-seg2[0][0])**2 + (intersection[1]-seg2[0][1])**2),
-                        math.sqrt((intersection[0]-seg2[-1][0])**2 + (intersection[1]-seg2[-1][1])**2),
-                    ]
-                    if min(dists) < 0.2:
-                        corners.append(tuple(intersection))
+                if intersection is None:
+                    continue
+                
+                # Check if corner is near either segment's endpoints
+                dists = [
+                    math.sqrt((intersection[0]-seg1[0][0])**2 + (intersection[1]-seg1[0][1])**2),
+                    math.sqrt((intersection[0]-seg1[-1][0])**2 + (intersection[1]-seg1[-1][1])**2),
+                    math.sqrt((intersection[0]-seg2[0][0])**2 + (intersection[1]-seg2[0][1])**2),
+                    math.sqrt((intersection[0]-seg2[-1][0])**2 + (intersection[1]-seg2[-1][1])**2),
+                ]
+                
+                # Must be near at least one endpoint of each segment
+                near_seg1 = min(dists[0], dists[1]) < 0.2
+                near_seg2 = min(dists[2], dists[3]) < 0.2
+                
+                if near_seg1 and near_seg2:
+                    corners.append(tuple(intersection))
         
-        return corners
+        # Remove duplicate corners
+        return self.remove_duplicate_corners(corners, threshold=0.1)
+
+    def remove_duplicate_corners(self, corners, threshold=0.1):
+        """Cluster nearby corners and return unique ones"""
+        if not corners:
+            return []
+        
+        unique = []
+        used = [False] * len(corners)
+        
+        for i, c1 in enumerate(corners):
+            if used[i]:
+                continue
+            
+            cluster = [c1]
+            used[i] = True
+            
+            for j, c2 in enumerate(corners):
+                if not used[j]:
+                    dist = math.sqrt((c1[0] - c2[0])**2 + (c1[1] - c2[1])**2)
+                    if dist < threshold:
+                        cluster.append(c2)
+                        used[j] = True
+            
+            # Average the cluster
+            avg_x = sum(c[0] for c in cluster) / len(cluster)
+            avg_y = sum(c[1] for c in cluster) / len(cluster)
+            unique.append((avg_x, avg_y))
+        
+        return unique
     
     def plot_scan(self, points, pose, corners=None):
         # plot scan points and robot
@@ -297,6 +419,46 @@ class Scans:
         plt.title('EKF-SLAM Map')
         plt.show()
 
+    def plot_segments_and_lines(self, points, pose):
+        """Debug visualization for segmentation and line fitting"""
+        segments = self.segment_scan(points)
+        
+        plt.figure(figsize=(12, 12))
+        
+        # Plot all points
+        if points:
+            xs, ys = zip(*points)
+            plt.scatter(xs, ys, c='lightblue', s=30, label='Scan points', alpha=0.5)
+        
+        # Plot segments in different colors
+        colors = plt.cm.rainbow(np.linspace(0, 1, len(segments)))
+        for i, seg in enumerate(segments):
+            if len(seg) > 0:
+                sx, sy = zip(*seg)
+                plt.scatter(sx, sy, c=[colors[i]], s=50, label=f'Seg {i} ({len(seg)} pts)')
+                
+                # Fit and plot line
+                if len(seg) >= 3:
+                    centroid, direction = self.fit_line(seg, max_iterations=50, threshold=0.03)
+                    if centroid is not None:
+                        # Draw line extending through segment
+                        t_vals = np.linspace(-0.5, 0.5, 100)
+                        line_x = centroid[0] + t_vals * direction[0]
+                        line_y = centroid[1] + t_vals * direction[1]
+                        plt.plot(line_x, line_y, c=colors[i], linewidth=2, linestyle='--')
+        
+        # Plot robot
+        rx, ry, rtheta = pose
+        plt.plot(rx, ry, 'ro', markersize=12, label='Robot')
+        plt.arrow(rx, ry, 0.1*math.cos(rtheta), 0.1*math.sin(rtheta), 
+                head_width=0.03, color='red')
+        
+        plt.axis('equal')
+        plt.grid(True)
+        plt.legend()
+        plt.title('Segment Detection and Line Fitting')
+        plt.show()
+
 class EKFSlam:
     def __init__(self):
         # State: [x, y, theta, lx1, ly1, ...]
@@ -310,7 +472,7 @@ class EKFSlam:
         self.R = np.diag([0.2,0.4]) # range, bearing variance
 
         # Data association threshold
-        self.association_threshold = 1.0 # meters
+        self.association_threshold = 0.2# meters
 
         # Number of landmarks 
         self.n_landmarks = 0
@@ -508,7 +670,7 @@ class Explorer:
 
     def detect_gaps(self, scan_result, pose, min_gap_width=0.5):
         # Detect gaps in scan that could be doors
-        points = self.scans.scan_to_cartesian(scan_result['scan'], pose)
+        points, _ = self.scans.scan_to_cartesian(scan_result['scan'], pose)
         rx, ry, rtheta = pose
         gaps = []
 
@@ -568,7 +730,7 @@ class Explorer:
                 continue
 
             # Update ekf
-            points = self.scans.scan_to_cartesian(result['scan'], pose)
+            points, _ = self.scans.scan_to_cartesian(result['scan'], pose)
             corners = self.scans.detect_corners(points)
             observations = self.ekf.corners_to_observations(corners, pose)
             self.ekf.update(observations)
@@ -622,10 +784,11 @@ class Explorer:
             # Wall ahead - turn away
             if side == 'right':
                 print("  Wall ahead, turning left")
-                return ('rotate', -45)
+                
+                return ('rotate_move', -45, -dist/2)
             else:
                 print("  Wall ahead, turning right")
-                return ('rotate', +45)
+                return ('rotate_move', +45, -dist/2)
             
             
         elif side == 'right':
@@ -651,7 +814,7 @@ class Explorer:
     
     def get_distances(self, scan_result, pose):
         # Get distances in front, right, left directions
-        points = self.scans.scan_to_cartesian(scan_result['scan'], pose)
+        points, _ = self.scans.scan_to_cartesian(scan_result['scan'], pose)
         rx, ry, rtheta = pose
 
         front_dist = 2.0
@@ -728,7 +891,7 @@ class Explorer:
                 continue
             
             # Update EKF
-            points = self.scans.scan_to_cartesian(result['scan'], pose)
+            points, _ = self.scans.scan_to_cartesian(result['scan'], pose)
             corners = self.scans.detect_corners(points)
             observations = self.ekf.corners_to_observations(corners, pose)
             self.ekf.update(observations)
@@ -1224,9 +1387,9 @@ class OccupancyGrid:
         
         return points
 
-    def update(self, pose, points):
+    def update(self, pose, points, max_range_angles=None, max_range=1.0):
         # Update grid with scan data
-        rx, ry, _= pose
+        rx, ry, rtheta= pose
         robot_gx, robot_gy = self.world_to_grid(rx,ry)
 
         for px, py in points:
@@ -1237,6 +1400,18 @@ class OccupancyGrid:
             
             # Trace ray from robot to point marka s free
             self.trace_ray(robot_gx, robot_gy, gx, gy)
+        
+        if max_range_angles is not None:
+            for angle in max_range_angles:
+                # Project ray to max range
+                world_angle=rtheta+angle
+                end_x = rx + max_range *math.cos(world_angle)
+                end_y = ry + max_range *math.sin(world_angle)
+
+                end_gx, end_gy = self.world_to_grid(end_x,end_y)
+
+                # Only mark ray as free not occupied
+                self.trace_ray(robot_gx, robot_gy, end_gx, end_gy)
 
     def trace_ray(self, x0, y0, x1, y1):
         # Bresenham's line algorithm to mark free cells

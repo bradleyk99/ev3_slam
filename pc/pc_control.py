@@ -6,7 +6,7 @@ import time
 ev3 = EV3Connection("/dev/rfcomm0")
 scans = Scans()
 ekf = EKFSlam()
-occ_grid = OccupancyGrid(size=6.0, resolution=0.1)
+occ_grid = OccupancyGrid(size=2.0, resolution=0.1)
 trajectory = []
 plotter = LivePlotter(occ_grid)
 explorer = Explorer(ev3, scans, ekf)
@@ -23,8 +23,8 @@ def scan(steps=5):
         return None
     
     occ_grid.store_scan(result['scan'], pose)
-    points = scans.scan_to_cartesian(result['scan'], pose)
-    occ_grid.update(pose, points)
+    points, max_range_angles = scans.scan_to_cartesian(result['scan'], pose)
+    occ_grid.update(pose, points, max_range_angles=max_range_angles)
     plotter.update(ekf, trajectory)
     
     corners = scans.detect_corners(points)
@@ -227,14 +227,16 @@ try:
     check_interval = 3  # Check for exits every N steps
     
     # Scan then move forward
-    print("Preparing to enter arena")
-    move(30)
+    #print("Preparing to enter arena")
+    #move(30)
 
     # Start with 360 degree scan
-    print("Scanning surroundings...")
+    #print("Scanning surroundings...")
+    """
     for step in range(4):
         scan()
         rotate(angle=90)
+    """
 
     print("=== Phase 1: Exploration ===\n")
     for step in range(max_steps):
@@ -261,7 +263,7 @@ try:
                 print("  No valid exits found yet, continuing exploration...")
         
         # Wall follow to explore
-        action = explorer.wall_follow_step(result, pose, wall_dist=0.25, side='right',dist=25, Kp=200)
+        action = explorer.wall_follow_step(result, pose, wall_dist=0.2, side='right',dist=15, Kp=200)
         execute_action(action)
         
         # Check if completed full loop
@@ -320,7 +322,6 @@ except KeyboardInterrupt:
     
     if len(trajectory) > 0:
         print("Generating partial map...")
-        occ_grid.rebuild_with_ekf(trajectory)
         occ_grid.plot(ekf, trajectory)
     
     ev3.stop()
