@@ -25,7 +25,17 @@ def scan(steps=5):
     occ_grid.store_scan(result['scan'], pose)
     points, max_range_angles = scans.scan_to_cartesian(result['scan'], pose)
     occ_grid.update(pose, points, max_range_angles=max_range_angles)
-    plotter.update(ekf, trajectory)
+
+    # Get fitted lines for viz
+    segments = scans.segment_scan(points, distance_threshold=0.2, angle_threshold=40)
+    fitted_lines = []
+    for seg in segments:
+        if len(seg) >= 3:
+            centroid, direction = scans.fit_line(seg)
+            if centroid is not None:
+                fitted_lines.append((centroid,direction))
+
+    plotter.update(ekf, trajectory, current_scan_points=points, fitted_line_segments=fitted_lines)
     
     corners = scans.detect_corners(points)
     print(f"Detected {len(corners)} corners")

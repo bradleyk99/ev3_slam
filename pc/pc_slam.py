@@ -1704,6 +1704,9 @@ class LivePlotter:
         plt.ion() #interactive mode
         self.fig, self.ax = plt.subplots(figsize=(10,10))
         self.occ_grid=occ_grid
+        self.landmark_ellipses = [] # Store ellipse patches
+        self.scan_points_scatter = self.ax.scatter([], [], c='cyan', s=20, alpha=0.6)
+        self.fitted_lines = []
 
         # Initial empty plot
         self.img = self.ax.imshow(
@@ -1728,7 +1731,7 @@ class LivePlotter:
 
         plt.show()
 
-    def update(self, ekf, trajectory):
+    def update(self, ekf, trajectory, current_scan_points=None, fitted_line_segments=None):
         # update occupancy grid image
         self.img.set_data(self.occ_grid.get_probability_grid())
 
@@ -1751,6 +1754,57 @@ class LivePlotter:
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
         plt.pause(0.01)
+
+        # Update scan points
+        if current_scan_points and len(current_scan_points) > 0:
+            sx, sy = zip(*current_scan_points)
+            self.scan_points_scatter.set_offsets(list(zip(sx, sy)))
+        else:
+            self.scan_points_scatter.set_offsets(np.empty((0, 2)))
+        
+        # Update fitted lines
+        # Remove old line plots
+        for line in self.fitted_lines:
+            line.remove()
+        self.fitted_lines = []
+
+        if fitted_line_segments:
+            colors = plt.cm.rainbow(np.linspace(0, 1, len(fitted_line_segments)))
+            for i, (centroid, direction) in enumerate(fitted_line_segments):
+                t_vals = np.linspace(-0.3, 0.3, 50)
+                line_x = centroid[0] + t_vals * direction[0]
+                line_y = centroid[1] + t_vals * direction[1]
+                line_plot, = self.ax.plot(line_x, line_y, color=colors[i], 
+                                        linewidth=2, linestyle='--', alpha=0.7)
+                self.fitted_lines.append(line_plot)
+        
+        # Update landmark uncertainty ellipses
+        # Remove old ellipses
+        for ellipse in self.landmark_ellipses:
+                ellipse.remove()
+        self.landmark_ellipses = []
+
+        # Draw new ellipses
+        for i in range(ekf.n_landmarks):
+            idx = 3 + i*2
+            lx, ly = ekf.state[idx], ekf.state[idx+1]
+        
+            # Get landmark covariance (2x2)
+            P_landmark = ekf.P[idx:idx+2, idx:idx+2]
+            
+            # Compute ellipse from covariance
+            eigenvalues, eigenvectors = np.linalg.eig(P_landmark)
+            angle = math.degrees(math.atan2(eigenvectors[1, 0], eigenvectors[0, 0]))
+            
+            # 1-sigma ellipse (68% confidence)
+            width = 2 * np.sqrt(abs(eigenvalues[0]))
+            height = 2 * np.sqrt(abs(eigenvalues[1]))
+            
+            ellipse = patches.Ellipse((lx, ly), width, height, angle=angle,
+                                    fill=False, color='red', linestyle='--', 
+                                    linewidth=1.5, alpha=0.7)
+            self.ax.add_patch(ellipse)
+            self.landmark_ellipses.append(ellipse)
     
     def close(self):
         plt.ioff()
