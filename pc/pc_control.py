@@ -10,7 +10,7 @@ occ_grid = OccupancyGrid(size=2.0, resolution=0.1)
 trajectory = []
 plotter = LivePlotter(occ_grid)
 explorer = Explorer(ev3, scans, ekf)
-path_planner = PathPlanner(occ_grid, robot_radius=0.10)
+path_planner = PathPlanner(occ_grid, robot_radius=0.01)
 explorer.entry_pose = ekf.get_pose().copy()
 
 def scan(steps=5):
@@ -102,9 +102,9 @@ def navigate_to_waypoint(target_x, target_y, max_steps=20):
             continue
         
         # Update EKF and map
-        points = scans.scan_to_cartesian(result['scan'], pose)
+        points, max_range_angles = scans.scan_to_cartesian(result['scan'], pose)
         occ_grid.store_scan(result['scan'], pose)
-        occ_grid.update(pose, points)
+        occ_grid.update(pose, points, max_range_angles=max_range_angles, max_range=1.0)
         trajectory.append(pose.copy())
         
         corners = scans.detect_corners(points)
@@ -182,8 +182,9 @@ def navigate_to_exit(goal):
     
     if path is None:
         print("No path found!")
+        path_planner.plot_inflated(pose,None,(goal_x,goal_y))
         return False
-    
+
     # Simplify path
     waypoints = path_planner.simplify_path(path)
     print(f"Path has {len(waypoints)} waypoints")
@@ -220,11 +221,9 @@ def navigate_to_exit(goal):
 
 # ============= MAIN =============
 try:
-    
-    
     exit_found = None
     max_steps = 50
-    check_interval = 3  # Check for exits every N steps
+    check_interval = 1  # Check for exits every N steps
     
     # Scan then move forward
     #print("Preparing to enter arena")
@@ -238,77 +237,78 @@ try:
         rotate(angle=90)
     """
 
-    print("=== Phase 1: Exploration ===\n")
-    for step in range(max_steps):
-        print(f"Step {step + 1}")
-        
-        result = scan()
-        if result is None:
-            continue
-        
-        pose = ekf.get_pose()
-        
-        # Periodically check map for exit
-        
-        if step > 3 and step % check_interval == 0:
-            print("\n  --- Checking map for exits ---")
-            gaps = find_exit_in_map()
- 
-            if gaps:
-                # Use closest gap
-                exit_found = gaps[0]
-                print(f"  Exit selected at ({exit_found['center'][0]:.2f}, {exit_found['center'][1]:.2f})")
-                #break
-            else:
-                print("  No valid exits found yet, continuing exploration...")
-        
-        # Wall follow to explore
-        action = explorer.wall_follow_step(result, pose, wall_dist=0.2, side='right',dist=15, Kp=200)
-        execute_action(action)
-        
-        # Check if completed full loop
-        if step > 25:
-            dist_to_entry = math.sqrt(
-                (pose[0] - explorer.entry_pose[0])**2 +
-                (pose[1] - explorer.entry_pose[1])**2
-            )
-            if dist_to_entry < 0.25:
-                print("\nCompleted loop around arena")
-                
-                # Final check for exits
+    while (True):
+        print("=== Phase 1: Exploration ===\n")
+        for step in range(max_steps):
+            print(f"Step {step + 1}")
+            
+            result = scan()
+            if result is None:
+                continue
+            
+            pose = ekf.get_pose()
+            
+            # Periodically check map for exit
+            
+            if step > 6 and step % check_interval == 0:
+                print("\n  --- Checking map for exits ---")
                 gaps = find_exit_in_map()
+    
                 if gaps:
+                    # Use closest gap
                     exit_found = gaps[0]
+                    print(f"  Exit selected at ({exit_found['center'][0]:.2f}, {exit_found['center'][1]:.2f})")
+                    break
+                else:
+                    print("  No valid exits found yet, continuing exploration...")
+            
+            # Wall follow to explore
+            action = explorer.wall_follow_step(result, pose, wall_dist=0.2, side='right',dist=15, Kp=200)
+            execute_action(action)
+            
+            # Check if completed full loop
+            if step > 25:
+                dist_to_entry = math.sqrt(
+                    (pose[0] - explorer.entry_pose[0])**2 +
+                    (pose[1] - explorer.entry_pose[1])**2
+                )
+                if dist_to_entry < 0.25:
+                    print("\nCompleted loop around arena")
+                    
+                    # Final check for exits
+                    gaps = find_exit_in_map()
+                    if gaps:
+                        exit_found = gaps[0]
+                    break
+        
+        print(f"\n=== Exploration Complete ===")
+        print(f"Steps: {step + 1}")
+        print(f"Landmarks: {ekf.n_landmarks}")
+        print(f"Scans stored: {len(occ_grid.scan_history)}")
+        
+        # Phase 2: Navigate to exit
+        if exit_found:
+            print("\n=== Phase 2: Navigate to Exit ===")
+            
+            # Visualize gaps
+            pose = ekf.get_pose()
+            all_gaps = path_planner.find_gaps_in_grid(pose)
+            if all_gaps:
+                path_planner.plot_gaps(pose, all_gaps)
+            
+            # Navigate to exit
+            success = navigate_to_exit(exit_found)
+            
+            if success:
+                print("\n*** ESCAPED! ***")
                 break
-    
-    print(f"\n=== Exploration Complete ===")
-    print(f"Steps: {step + 1}")
-    print(f"Landmarks: {ekf.n_landmarks}")
-    print(f"Scans stored: {len(occ_grid.scan_history)}")
-    
-    # Phase 2: Navigate to exit
-    if exit_found:
-        print("\n=== Phase 2: Navigate to Exit ===")
-        
-        # Rebuild map before planning
-        occ_grid.rebuild_with_ekf(trajectory)
-        
-        # Visualize gaps
-        pose = ekf.get_pose()
-        all_gaps = path_planner.find_gaps_in_grid(pose)
-        if all_gaps:
-            path_planner.plot_gaps(pose, all_gaps)
-        
-        # Navigate to exit
-        success = navigate_to_exit(exit_found)
-        
-        if success:
-            print("\n*** ESCAPED! ***")
+            else:
+                print("\nFailed to reach exit, returning to exploring")
+                continue
         else:
-            print("\nFailed to reach exit")
-    else:
-        print("\nNo exit found during exploration")
-    
+            print("\nNo exit found during exploration")
+            break
+
     # Final map
     print("\nGenerating final map...")
     occ_grid.rebuild_with_ekf(trajectory)

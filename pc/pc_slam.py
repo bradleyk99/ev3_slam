@@ -257,7 +257,7 @@ class Scans:
         intersection = p1 + t * d1
         return intersection
 
-    def detect_corners(self, points, distance_threshold=0.15, angle_threshold=45):
+    def detect_corners(self, points, distance_threshold=0.2, angle_threshold=45):
         """Enhanced corner detection using RANSAC for line fitting"""
         segments = self.segment_scan(points, distance_threshold, angle_threshold=45)
         print(f"  Segments: {len(segments)}, sizes: {[len(s) for s in segments]}")
@@ -467,7 +467,7 @@ class EKFSlam:
         # Covariance
         self.P = np.diag([0.1, 0.1, 0.1]) # Assume small initial uncertainty
         # Motion noise
-        self.Q = np.diag([0.01, 0.01, 0.5]) # x, y, theta variance per motion
+        self.Q = np.diag([0.02, 0.02, 0.1]) # x, y, theta variance per motion
         # Observation (measurement) noise
         self.R = np.diag([0.2,0.4]) # range, bearing variance
 
@@ -671,7 +671,7 @@ class EKFSlam:
         z = np.array([r_obs - r_pred, self.normalize_angle(b_obs - b_pred)])
 
         # Innovation gating
-        if abs(z[0]) > 0.5 or abs(z[1]) > np.radians(45):
+        if abs(z[0]) > 0.5 or abs(z[1]) > np.radians(90):
             print(f"    Rejected update: innovation too large (dr={z[0]:.3f}, db={np.degrees(z[1]):.1f}°)")
             return
 
@@ -1107,16 +1107,17 @@ class PathPlanner:
         return [(c[0], c[1]) for c in clusters if c[2] >= 3]
     
     def find_gaps_in_grid(self, pose, min_gap_width=0.20):
-        """Find actual openings in walls, not just unexplored areas"""
+        #Find openings in walls - both narrow gaps and wide exits
         prob_grid = self.grid.get_probability_grid()
         rx, ry, rtheta = pose
         
-        # For each ray, record: did it hit a wall, and at what distance?
-        ray_results = []
+        print(f"\n  === Gap Detection Debug ===")
+        print(f"  Robot at ({rx:.2f}, {ry:.2f})")
         
-        for angle_deg in range(0, 360, 3):  # Finer resolution
+        # Cast rays in all directions
+        ray_results = []
+        for angle_deg in range(0, 360, 3):
             angle = math.radians(angle_deg)
-            
             wall_dist = None
             
             for dist in np.arange(0.1, 1.5, self.grid.resolution):
@@ -1136,111 +1137,173 @@ class PathPlanner:
             ray_results.append({
                 'angle': angle,
                 'angle_deg': angle_deg,
-                'wall_dist': wall_dist  # None if no wall hit
+                'wall_dist': wall_dist
             })
         
-        # Find gaps: sequences where neighboring rays hit walls, 
-        # but middle rays don't (or hit walls much further away)
+        print(f"  Total rays: {len(ray_results)}")
+        rays_no_wall = sum(1 for r in ray_results if r['wall_dist'] is None or r['wall_dist'] > 1.2)
+        print(f"  Rays with no close wall: {rays_no_wall}")
+        
+        # Find sequences of rays with no walls (wide openings)
         gaps = []
         n_rays = len(ray_results)
         
-        for i in range(n_rays):
-            # Look for pattern: wall - no wall - wall
-            prev_idx = (i - 5) % n_rays  # ~15 degrees back
-            next_idx = (i + 5) % n_rays  # ~15 degrees forward
-            
-            prev_ray = ray_results[prev_idx]
-            curr_ray = ray_results[i]
-            next_ray = ray_results[next_idx]
-            
-            # Check if neighbors hit walls but current doesn't (or hits much further)
-            prev_has_wall = prev_ray['wall_dist'] is not None and prev_ray['wall_dist'] < 1.0
-            next_has_wall = next_ray['wall_dist'] is not None and next_ray['wall_dist'] < 1.0
-            curr_no_wall = curr_ray['wall_dist'] is None or curr_ray['wall_dist'] > 1.2
-            
-            if prev_has_wall and next_has_wall and curr_no_wall:
-                # This looks like a gap - opening between two walls
-                angle = curr_ray['angle']
-                
-                # Gap distance is average of neighboring wall distances
-                gap_dist = (prev_ray['wall_dist'] + next_ray['wall_dist']) / 2
-                
-                gap_x = rx + gap_dist * math.cos(angle)
-                gap_y = ry + gap_dist * math.sin(angle)
-                
-                gaps.append({
-                    'center': (gap_x, gap_y),
-                    'angle': angle,
-                    'distance': gap_dist
-                })
+        in_opening = False
+        opening_start = 0
+        opening_rays = []
         
-        # Cluster nearby gaps
-        clustered_gaps = []
+        # Detect continuous sequences of rays with no walls
+        for i in range(n_rays + n_rays // 2):  # Loop around to catch wraparound
+            idx = i % n_rays
+            ray = ray_results[idx]
+            
+            is_open = ray['wall_dist'] is None or ray['wall_dist'] > 1.0
+            
+            if is_open:
+                if not in_opening:
+                    # Start of new opening
+                    in_opening = True
+                    opening_start = idx
+                    opening_rays = [ray]
+                else:
+                    # Continue current opening
+                    opening_rays.append(ray)
+            else:
+                if in_opening:
+                    # End of opening - process it
+                    if len(opening_rays) >= 3:  # At least 9 degrees wide
+                        # Find center ray of opening
+                        center_idx = len(opening_rays) // 2
+                        center_ray = opening_rays[center_idx]
+                        
+                        # Place gap at fixed distance into opening
+                        gap_dist = 0.6
+                        gap_x = rx + gap_dist * math.cos(center_ray['angle'])
+                        gap_y = ry + gap_dist * math.sin(center_ray['angle'])
+                        
+                        # Verify location is free
+                        gx, gy = self.grid.world_to_grid(gap_x, gap_y)
+                        if self.grid.in_bounds(gx, gy) and prob_grid[gy, gx] < 0.5:
+                            gaps.append({
+                                'center': (gap_x, gap_y),
+                                'angle': center_ray['angle'],
+                                'distance': gap_dist,
+                                'width_deg': len(opening_rays) * 3,  # Angular width
+                                'size': len(opening_rays)
+                            })
+                            print(f"    Found opening: {len(opening_rays)} rays ({len(opening_rays)*3}°) at {math.degrees(center_ray['angle']):.0f}°")
+                    
+                    in_opening = False
+                    opening_rays = []
+        
+        print(f"  Raw openings found: {len(gaps)}")
+        
+        # Remove duplicates (openings detected from wraparound)
+        unique_gaps = []
         used = [False] * len(gaps)
         
         for i, gap in enumerate(gaps):
             if used[i]:
                 continue
             
-            cluster = [gap]
-            used[i] = True
+            # Check if similar gap already added
+            is_duplicate = False
+            for existing in unique_gaps:
+                angle_diff = abs(gap['angle'] - existing['angle'])
+                if angle_diff > math.pi:
+                    angle_diff = 2 * math.pi - angle_diff
+                
+                if angle_diff < math.radians(20):  # Within 20 degrees
+                    is_duplicate = True
+                    break
             
-            for j, other in enumerate(gaps):
-                if not used[j]:
-                    dist = math.sqrt(
-                        (gap['center'][0] - other['center'][0])**2 +
-                        (gap['center'][1] - other['center'][1])**2
-                    )
-                    if dist < 0.25:
-                        cluster.append(other)
-                        used[j] = True
-            
-            # Average the cluster
-            avg_x = sum(g['center'][0] for g in cluster) / len(cluster)
-            avg_y = sum(g['center'][1] for g in cluster) / len(cluster)
-            avg_dist = sum(g['distance'] for g in cluster) / len(cluster)
-            avg_angle = sum(g['angle'] for g in cluster) / len(cluster)
-            
-            clustered_gaps.append({
-                'center': (avg_x, avg_y),
-                'angle': avg_angle,
-                'distance': avg_dist,
-                'size': len(cluster)
-            })
+            if not is_duplicate:
+                unique_gaps.append(gap)
         
-        # Filter to significant gaps (multiple rays)
-        significant = [g for g in clustered_gaps if g['size'] >= 2]
+        print(f"  After deduplication: {len(unique_gaps)} openings")
         
-        return significant
+        for i, g in enumerate(unique_gaps):
+            print(f"    Opening {i+1}: center=({g['center'][0]:.2f}, {g['center'][1]:.2f}), "
+                f"dist={g['distance']:.2f}m, angle={math.degrees(g['angle']):.0f}°, width={g['width_deg']}°")
+        
+        return unique_gaps
     
     def astar(self, start_pose, goal, use_inflation=True):
-        """A* path planning on occupancy grid"""
+        # A* path planning with extensive debug
         import heapq
         
-        # Inflate obstacles if needed
+        print(f"\n  === A* Planning Debug ===")
+        
+        # Inflate obstacles
         if use_inflation:
             self.inflate_obstacles()
             grid_to_use = self.inflated_grid
+            print(f"  Using inflated grid (robot radius={self.robot_radius}m)")
         else:
             grid_to_use = self.grid.get_probability_grid()
+            print(f"  Using original grid")
         
         start_gx, start_gy = self.grid.world_to_grid(start_pose[0], start_pose[1])
         goal_gx, goal_gy = self.grid.world_to_grid(goal[0], goal[1])
         
+        print(f"  Start: world=({start_pose[0]:.2f}, {start_pose[1]:.2f}) -> grid=({start_gx}, {start_gy})")
+        print(f"  Goal:  world=({goal[0]:.2f}, {goal[1]:.2f}) -> grid=({goal_gx}, {goal_gy})")
+        
         if not self.grid.in_bounds(start_gx, start_gy):
-            print("  Start out of bounds")
+            print(f"  ERROR: Start out of bounds!")
             return None
         if not self.grid.in_bounds(goal_gx, goal_gy):
-            print("  Goal out of bounds")
+            print(f"  ERROR: Goal out of bounds!")
             return None
         
-        # Check if start or goal is in obstacle
-        if grid_to_use[start_gy, start_gx] > 0.5:
-            print("  Start is in obstacle!")
-            return None
-        if grid_to_use[goal_gy, goal_gx] > 0.5:
-            print("  Goal is in obstacle!")
-            return None
+        start_prob = grid_to_use[start_gy, start_gx]
+        goal_prob = grid_to_use[goal_gy, goal_gx]
+        print(f"  Start cell probability: {start_prob:.3f} ({'OCCUPIED' if start_prob > 0.5 else 'FREE'})")
+        print(f"  Goal cell probability: {goal_prob:.3f} ({'OCCUPIED' if goal_prob > 0.5 else 'FREE'})")
+        
+        # Fix start if needed
+        if start_prob > 0.5:
+            print(f"  WARNING: Start in obstacle, searching for free cell...")
+            found = False
+            for radius in range(1, 20):
+                for dx in range(-radius, radius+1):
+                    for dy in range(-radius, radius+1):
+                        nx, ny = start_gx + dx, start_gy + dy
+                        if self.grid.in_bounds(nx, ny) and grid_to_use[ny, nx] < 0.5:
+                            start_gx, start_gy = nx, ny
+                            wx, wy = self.grid.grid_to_world(start_gx, start_gy)
+                            print(f"  Moved start to: grid=({start_gx}, {start_gy}), world=({wx:.2f}, {wy:.2f})")
+                            found = True
+                            break
+                    if found:
+                        break
+                if found:
+                    break
+            if not found:
+                print(f"  ERROR: No free cells near start!")
+                return None
+        
+        # Fix goal if needed
+        if goal_prob > 0.5:
+            print(f"  WARNING: Goal in obstacle, searching for free cell...")
+            found = False
+            for radius in range(1, 30):
+                for dx in range(-radius, radius+1):
+                    for dy in range(-radius, radius+1):
+                        nx, ny = goal_gx + dx, goal_gy + dy
+                        if self.grid.in_bounds(nx, ny) and grid_to_use[ny, nx] < 0.5:
+                            goal_gx, goal_gy = nx, ny
+                            wx, wy = self.grid.grid_to_world(goal_gx, goal_gy)
+                            print(f"  Moved goal to: grid=({goal_gx}, {goal_gy}), world=({wx:.2f}, {wy:.2f})")
+                            found = True
+                            break
+                    if found:
+                        break
+                if found:
+                    break
+            if not found:
+                print(f"  ERROR: No free cells near goal!")
+                return None
         
         def heuristic(a, b):
             return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
@@ -1248,16 +1311,30 @@ class PathPlanner:
         def is_valid(x, y):
             if not self.grid.in_bounds(x, y):
                 return False
-            return grid_to_use[y, x] < 0.5
+            return grid_to_use[y, x] < 0.5  # Free if prob < 0.5
         
+        print(f"  Starting A* search...")
         open_set = [(0, start_gx, start_gy)]
         came_from = {}
         g_score = {(start_gx, start_gy): 0}
+        closed_set = set()
+        nodes_explored = 0
         
         while open_set:
             _, cx, cy = heapq.heappop(open_set)
             
+            # Skip if already processed
+            if (cx, cy) in closed_set:
+                continue
+            
+            closed_set.add((cx, cy))
+            nodes_explored += 1
+            
+            if nodes_explored % 100 == 0:
+                print(f"  ... explored {nodes_explored} nodes, open_set size={len(open_set)}")
+            
             if (cx, cy) == (goal_gx, goal_gy):
+                print(f"  SUCCESS! Found path after exploring {nodes_explored} nodes")
                 # Reconstruct path
                 path = []
                 current = (goal_gx, goal_gy)
@@ -1266,21 +1343,20 @@ class PathPlanner:
                     path.append((wx, wy))
                     current = came_from[current]
                 path.reverse()
+                print(f"  Path has {len(path)} waypoints")
                 return path
-            
-            # Skip if already processed with better score
-            if (cx, cy) in came_from and (cx, cy) != (start_gx, start_gy):
-                continue
             
             # 8-connected neighbors
             for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1), 
-                           (-1, -1), (-1, 1), (1, -1), (1, 1)]:
+                        (-1, -1), (-1, 1), (1, -1), (1, 1)]:
                 nx, ny = cx + dx, cy + dy
                 
                 if not is_valid(nx, ny):
                     continue
                 
-                # Diagonal moves cost more
+                if (nx, ny) in closed_set:
+                    continue
+                
                 move_cost = 1.414 if dx != 0 and dy != 0 else 1.0
                 tentative_g = g_score[(cx, cy)] + move_cost
                 
@@ -1290,7 +1366,22 @@ class PathPlanner:
                     f_score = tentative_g + heuristic((nx, ny), (goal_gx, goal_gy))
                     heapq.heappush(open_set, (f_score, nx, ny))
         
-        print("  No path found")
+        print(f"  FAILURE: No path found after exploring {nodes_explored} nodes")
+        print(f"  Closed set size: {len(closed_set)}")
+        
+        # Check if goal was reachable
+        if (goal_gx, goal_gy) in closed_set:
+            print(f"  ERROR: Goal was explored but not reached - logic error!")
+        else:
+            print(f"  Goal never reached - isolated by obstacles")
+            # Check neighbors of goal
+            free_neighbors = 0
+            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nx, ny = goal_gx + dx, goal_gy + dy
+                if self.grid.in_bounds(nx, ny) and grid_to_use[ny, nx] < 0.5:
+                    free_neighbors += 1
+            print(f"  Goal has {free_neighbors}/4 free neighbors")
+        
         return None
     
     def simplify_path(self, path, tolerance=0.1):
@@ -1680,7 +1771,7 @@ def main():
                 print("Error during scan")
                 continue
 
-            points = scans.scan_to_cartesian(result['scan'], pose)
+            points, _ = scans.scan_to_cartesian(result['scan'], pose)
             corners = scans.detect_corners(points)
             print(f"Detected {len(corners)} corners")
 
@@ -1711,7 +1802,7 @@ def main():
         print("--- Final scan ---")
         pose = ekf.get_pose()
         result = ev3.scan(step=5)
-        points = scans.scan_to_cartesian(result['scan'], pose)
+        points, _ = scans.scan_to_cartesian(result['scan'], pose)
         corners = scans.detect_corners(points)
         observations = ekf.corners_to_observations(corners, pose)
         ekf.update(observations)
