@@ -202,7 +202,7 @@ def navigate_to_exit(goal):
             print("  Replanning...")
             
             # Rebuild map and replan
-            occ_grid.rebuild_with_ekf(trajectory)
+            # occ_grid.rebuild_with_ekf(trajectory)
             pose = ekf.get_pose()
             new_path = path_planner.astar(pose, (goal_x, goal_y))
             
@@ -311,7 +311,7 @@ try:
 
     # Final map
     print("\nGenerating final map...")
-    occ_grid.rebuild_with_ekf(trajectory)
+    # occ_grid.rebuild_with_ekf(trajectory)
     occ_grid.plot(ekf, trajectory)
     
     input("\nPress Enter to close...")
