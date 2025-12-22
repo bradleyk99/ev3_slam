@@ -119,7 +119,7 @@ class Scans:
         max_range_angles = []
 
         for angle_deg, distance_cm in scan:
-            angle_rad = math.radians(-angle_deg)
+            angle_rad = math.radians(angle_deg)
 
             if distance_cm > 100:   # Values above a threshold detect empty
                 max_range_angles.append(angle_rad)
@@ -1558,7 +1558,7 @@ class OccupancyGrid:
             if distance_cm > 150:  # Filter distant readings
                 continue
             
-            angle_rad = math.radians(-angle_deg)
+            angle_rad = math.radians(angle_deg)
             local_x = (distance_cm / 100) * math.cos(angle_rad)
             local_y = (distance_cm / 100) * math.sin(angle_rad)
             

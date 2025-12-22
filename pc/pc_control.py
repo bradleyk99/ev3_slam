@@ -149,7 +149,7 @@ def navigate_to_waypoint(target_x, target_y, max_steps=20):
         angle_diff = explorer.normalize_angle(target_angle - rtheta)
         
         if abs(angle_diff) > math.radians(20):
-            turn = -math.degrees(angle_diff)  # Negate for EV3 convention
+            turn = -math.degrees(angle_diff)    # Negative for motor convention
             turn = max(-60, min(60, turn))
             print(f"    Turning {turn:.1f}°")
             rotate(turn)
