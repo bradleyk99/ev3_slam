@@ -92,6 +92,7 @@ def execute_action(action):
 def navigate_to_waypoint(target_x, target_y, max_steps=20):
     """Navigate to a waypoint with obstacle avoidance"""
     print(f"  Navigating to ({target_x:.2f}, {target_y:.2f})")
+    consecutive_obstacles = 0 
     
     for step in range(max_steps):
         pose = ekf.get_pose()
@@ -104,7 +105,7 @@ def navigate_to_waypoint(target_x, target_y, max_steps=20):
         
         if dist < 0.10:
             print(f"    Reached waypoint!")
-            return True
+            return (True, False)
         
         # Scan for obstacles
         result = ev3.scan(step=10)
@@ -128,12 +129,20 @@ def navigate_to_waypoint(target_x, target_y, max_steps=20):
         
         # Obstacle check first
         if front_dist < 0.15:
-            print("    Obstacle ahead! Avoiding...")
+            consecutive_obstacles += 1
+            print("    Obstacle ahead! Avoiding... (Count: {consecutive_obstacles})")
+
+            if consecutive_obstacles >= 3:
+                print("Persistent obstacle - replanning")
+                return (False, True)
+            
             if left_dist > right_dist:
-                rotate(-45)
+                rotate(-30)
             else:
-                rotate(45)
+                rotate(30)
             continue
+        else:
+            consecutive_obstacles=0
         
         # Angle to target
         target_angle = math.atan2(dy, dx)
@@ -151,7 +160,7 @@ def navigate_to_waypoint(target_x, target_y, max_steps=20):
             move(move_dist)
     
     print(f"    Failed to reach waypoint after {max_steps} steps")
-    return False
+    return (False, False)
 
 def find_exit_in_map():
     """Rebuild map and search for exits"""
@@ -188,7 +197,7 @@ def navigate_to_exit(goal):
     print(f"\nPlanning path from ({pose[0]:.2f}, {pose[1]:.2f}) to ({goal_x:.2f}, {goal_y:.2f})")
     
     # Plan path
-    path = path_planner.astar(pose, (goal_x, goal_y))
+    path = path_planner.astar(pose, (goal_x, goal_y), use_inflation=False)
     
     if path is None:
         print("No path found!")
@@ -202,26 +211,40 @@ def navigate_to_exit(goal):
     # Visualize path
     path_planner.plot_inflated(pose, waypoints, (goal_x, goal_y), filename='planned_path.png')
     
-    # Navigate through waypoints
-    for i, (wx, wy) in enumerate(waypoints):
-        print(f"\nWaypoint {i+1}/{len(waypoints)}: ({wx:.2f}, {wy:.2f})")
+    # Navigate through waypoints with replanning
+    max_replans = 5
+    replan_count = 0
+    waypoint_idx = 0
+
+    while waypoint_idx < len(waypoints):
+        wx, wy = waypoints[waypoint_idx]
+        print(f"\nWaypoint {waypoint_idx+1}/{len(waypoints)}: ({wx:.2f}, {wy:.2f})")
         
-        success = navigate_to_waypoint(wx, wy)
+        success, obstacle_detected = navigate_to_waypoint(wx, wy)
         
-        if not success:
-            print("  Replanning...")
+        if success:
+            waypoint_idx += 1
+        elif obstacle_detected:
+            print("  Obstacle detected, replanning path...")
+            replan_count += 1
             
-            # Rebuild map and replan
-            # occ_grid.rebuild_with_ekf(trajectory)
+            if replan_count > max_replans:
+                print(f"  Max replans ({max_replans}) reached, giving up")
+                return False
+            
             pose = ekf.get_pose()
             new_path = path_planner.astar(pose, (goal_x, goal_y))
             
             if new_path:
                 waypoints = path_planner.simplify_path(new_path)
+                waypoint_idx = 0
                 print(f"  New path has {len(waypoints)} waypoints")
             else:
-                print("  Replanning failed!")
+                print("  Replanning failed - no path found!")
                 return False
+        else:
+            print("  Failed to reach waypoint")
+            return False
     
     # Move forward to clear the exit
     print("\nClearing exit...")
