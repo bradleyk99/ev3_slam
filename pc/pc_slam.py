@@ -83,7 +83,7 @@ class Scans:
     def __init__(self):
         # Robot parameters
         self.WHEEL_RADIUS = 0.0275 # meters
-        self.WHEEL_BASE = 0.1 # meters
+        self.WHEEL_BASE = 0.107 # meters
         self.TICKS_PER_REV = 360
 
     def ticks_to_meters(self, ticks):
@@ -257,7 +257,7 @@ class Scans:
         intersection = p1 + t * d1
         return intersection
 
-    def detect_corners(self, points, distance_threshold=0.2, angle_threshold=45):
+    def detect_corners(self, points, distance_threshold=0.25, angle_threshold=45):
         """Enhanced corner detection using RANSAC for line fitting"""
         segments = self.segment_scan(points, distance_threshold, angle_threshold=45)
         print(f"  Segments: {len(segments)}, sizes: {[len(s) for s in segments]}")
@@ -614,7 +614,7 @@ class EKFSlam:
         
         # 2. If Mahalanobis failed BUT Euclidean is very small, still associate
         # This catches cases where EKF uncertainty is wrong
-        euclidean_threshold = 0.20  # 20cm - definitely same landmark
+        euclidean_threshold = 0.25  # 25cm - definitely same landmark
         if best_euclidean < euclidean_threshold:
             print(f"    -> Associated with L{best_idx+1} (Euclidean < {euclidean_threshold}m override)")
             return best_idx
@@ -863,14 +863,22 @@ class Explorer:
         front_dist, right_dist, left_dist = self.get_distances(scan_result, pose)
         print(f"  F={front_dist:.2f}m, R={right_dist:.2f}m, L={left_dist:.2f}m")
         
-        if front_dist < (dist*2/100):
+        if front_dist < (0.35):
             # Wall ahead - turn away
             if side == 'right':
-                print("  Wall ahead, turning left")
-                return ('rotate_move', -45, -1*dist/2)
+                if not None:
+                    print("  Wall ahead, turning left")
+                    return ('rotate', -45)
+                else:
+                    print("Wall Ahead, Turning right")
+                    return('rotate', +45)
             else:
-                print("  Wall ahead, turning right")
-                return ('rotate_move', +45, -1*dist/2)
+                if not None:
+                    print("  Wall ahead, turning right")
+                    return ('rotate', +45)
+                else:
+                    print("  Wall ahead, turning left")
+                    return ('rotate', -45)
             
             
         elif side == 'right':
@@ -1177,7 +1185,7 @@ class PathPlanner:
                         center_ray = opening_rays[center_idx]
                         
                         # Place gap at fixed distance into opening
-                        gap_dist = 0.6
+                        gap_dist = 0.8
                         gap_x = rx + gap_dist * math.cos(center_ray['angle'])
                         gap_y = ry + gap_dist * math.sin(center_ray['angle'])
                         

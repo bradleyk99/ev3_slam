@@ -6,11 +6,11 @@ import time
 ev3 = EV3Connection("/dev/rfcomm0")
 scans = Scans()
 ekf = EKFSlam()
-occ_grid = OccupancyGrid(size=2.0, resolution=0.1)
+occ_grid = OccupancyGrid(size=6.0, resolution=0.1)
 trajectory = []
 plotter = LivePlotter(occ_grid)
 explorer = Explorer(ev3, scans, ekf)
-path_planner = PathPlanner(occ_grid, robot_radius=0.01)
+path_planner = PathPlanner(occ_grid, robot_radius=0.05)
 explorer.entry_pose = ekf.get_pose().copy()
 
 def scan(steps=5):
@@ -128,7 +128,7 @@ def navigate_to_waypoint(target_x, target_y, max_steps=20):
         print(f"    Step {step+1}: dist={dist:.2f}m, F={front_dist:.2f}m, R={right_dist:.2f}m, L={left_dist:.2f}m")
         
         # Obstacle check first
-        if front_dist < 0.15:
+        if front_dist < 0.25:
             consecutive_obstacles += 1
             print("    Obstacle ahead! Avoiding... (Count: {consecutive_obstacles})")
 
@@ -197,7 +197,7 @@ def navigate_to_exit(goal):
     print(f"\nPlanning path from ({pose[0]:.2f}, {pose[1]:.2f}) to ({goal_x:.2f}, {goal_y:.2f})")
     
     # Plan path
-    path = path_planner.astar(pose, (goal_x, goal_y), use_inflation=False)
+    path = path_planner.astar(pose, (goal_x, goal_y), use_inflation=True)
     
     if path is None:
         print("No path found!")
@@ -260,11 +260,11 @@ try:
     
     # Scan then move forward
     #print("Preparing to enter arena")
-    #move(30)
+    move(30)
 
     # Start with 360 degree scan
-    #print("Scanning surroundings...")
     """
+    print("Scanning surroundings...")
     for step in range(4):
         scan()
         rotate(angle=90)
@@ -283,7 +283,7 @@ try:
             
             # Periodically check map for exit
             
-            if step > 6 and step % check_interval == 0:
+            if step > 25 and step % check_interval == 0:
                 print("\n  --- Checking map for exits ---")
                 gaps = find_exit_in_map()
     
@@ -296,11 +296,11 @@ try:
                     print("  No valid exits found yet, continuing exploration...")
             
             # Wall follow to explore
-            action = explorer.wall_follow_step(result, pose, wall_dist=0.2, side='right',dist=15, Kp=200)
+            action = explorer.wall_follow_step(result, pose, wall_dist=0.3, side='right',dist=20, Kp=150)
             execute_action(action)
             
             # Check if completed full loop
-            if step > 25:
+            if step > 35:
                 dist_to_entry = math.sqrt(
                     (pose[0] - explorer.entry_pose[0])**2 +
                     (pose[1] - explorer.entry_pose[1])**2
