@@ -47,21 +47,35 @@ def scan(steps=5):
     return result
 
 def move(distance, speed=10):
-    result = ev3.move(left_speed=speed, right_speed=speed, distance_cm=distance)
-    if result is None:
-        print("Error during move")
-        return False
-    
-    dx, dy, dtheta = scans.odometry(
-        result['odometry']['delta_left'],
-        result['odometry']['delta_right'],
-        ekf.get_pose()[2]
-    )
-    ekf.predict(dx, dy, dtheta)
-    
-    pose = ekf.get_pose()
-    trajectory.append(pose.copy())
-    plotter.update(ekf, trajectory)
+
+    interval_cm = 2
+    steps = distance/interval_cm
+    steps = int(steps)
+
+    for step in range(steps):
+        pose = ekf.get_pose()
+        dist = ev3.scan(start_angle=0, end_angle=0)
+        front_dist, _, _ = explorer.get_distances(dist, pose)
+        if front_dist < 0.2:
+            print("Too close to obstacle")
+            return False
+
+        result = ev3.move(left_speed=speed, right_speed=speed, distance_cm=interval_cm)
+        if result is None:
+            print("Error during move")
+            return False
+        
+        dx, dy, dtheta = scans.odometry(
+            result['odometry']['delta_left'],
+            result['odometry']['delta_right'],
+            ekf.get_pose()[2]
+        )
+
+        ekf.predict(dx, dy, dtheta)
+        
+        pose = ekf.get_pose()
+        trajectory.append(pose.copy())
+        plotter.update(ekf, trajectory)
     return True
 
 def rotate(angle, speed=10):
@@ -129,10 +143,10 @@ def navigate_to_waypoint(target_x, target_y, max_steps=20):
         
         # Obstacle check first
         if front_dist < 0.25:
-            consecutive_obstacles += 1
-            print("    Obstacle ahead! Avoiding... (Count: {consecutive_obstacles})")
+            consecutive_obstacles += 2
+            print(f"    Obstacle ahead! Avoiding... (Count: {consecutive_obstacles})")
 
-            if consecutive_obstacles >= 3:
+            if consecutive_obstacles >= 5:
                 print("Persistent obstacle - replanning")
                 return (False, True)
             
@@ -142,7 +156,7 @@ def navigate_to_waypoint(target_x, target_y, max_steps=20):
                 rotate(30)
             continue
         else:
-            consecutive_obstacles=0
+            consecutive_obstacles-=1
         
         # Angle to target
         target_angle = math.atan2(dy, dx)

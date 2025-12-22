@@ -51,7 +51,7 @@ class EV3Connection:
         })
         return self.recv()
     
-    def scan(self, start_angle=-120, end_angle=120, step=10):
+    def scan(self, start_angle=-90, end_angle=90, step=10):
         self.send({
             "type": "scan",
             "start_angle": start_angle,
@@ -863,19 +863,19 @@ class Explorer:
         front_dist, right_dist, left_dist = self.get_distances(scan_result, pose)
         print(f"  F={front_dist:.2f}m, R={right_dist:.2f}m, L={left_dist:.2f}m")
         
-        if front_dist < (0.35):
+        if front_dist < (0.3):
             # Wall ahead - turn away
             if side == 'right':
                 if not None:
                     print("  Wall ahead, turning left")
-                    return ('rotate', -45)
+                    return ('rotate', -30)
                 else:
                     print("Wall Ahead, Turning right")
                     return('rotate', +45)
             else:
                 if not None:
                     print("  Wall ahead, turning right")
-                    return ('rotate', +45)
+                    return ('rotate', +30)
                 else:
                     print("  Wall ahead, turning left")
                     return ('rotate', -45)
@@ -1004,8 +1004,10 @@ class Explorer:
                 print("  Obstacle ahead! Avoiding...")
                 if left_dist > right_dist:
                     self.rotate(-30)
+                    self.move(-5)
                 else:
                     self.rotate(30)
+                    self.move(-5)
                 continue  # Re-scan after avoiding
             
             # Now safe to turn or move
